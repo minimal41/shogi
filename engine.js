@@ -2117,7 +2117,7 @@ class Searcher {
     // mate search first
     if (opts.mateNodes && !inCheck) {
       if (!this.dfpn) this.dfpn = new DfPn(19);
-      const mateTime = Math.min(timeMs * 0.15, 1500);
+      const mateTime = Math.min(timeMs * 0.15, opts.mateTimeCap || 1500);
       const mm = this.dfpn.solve(pos, opts.mateNodes, mateTime, 48);
       if (mm) {
         const pv = this.dfpn.pv(40);
@@ -2130,7 +2130,7 @@ class Searcher {
     }
 
     let bestMove = rootMoves[0], bestScore = 0, prevScore = 0;
-    const soft = opts.analyze ? timeMs : timeMs * 0.55;
+    const soft = opts.analyze ? timeMs : timeMs * (opts.softRatio || 0.55);
     let stableCount = 0;
     for (let depth = 1; depth <= maxDepth; depth++) {
       this.rootDepth = depth;
@@ -2161,7 +2161,7 @@ class Searcher {
       if (opts.onInfo) opts.onInfo({ depth, score, nodes: this.nodes, pv: result.pv, time: el, mate: score >= MATE_IN_MAX ? MATE - score : score <= -MATE_IN_MAX ? -(MATE + score) : 0 });
       if (Math.abs(score) >= MATE_IN_MAX && depth > (MATE - Math.abs(score)) + 4) break;
       if (el > soft) break;
-      if (!opts.analyze && el > soft * 0.4 && stableCount >= 6 && depth >= 10) break;
+      if (!opts.analyze && el > soft * (opts.easyRatio || 0.4) && stableCount >= (opts.easyStable || 6) && depth >= 10) break;
     }
     result.move = bestMove; result.score = bestScore; result.nodes = this.nodes; result.time = now() - t0;
     if (bestScore >= MATE_IN_MAX) result.mate = MATE - bestScore;
@@ -2287,6 +2287,7 @@ function handleGo(searcher, msg, post) {
     if (msg.weak) res = searcher.thinkWeak({ depth: msg.weak.depth, noise: msg.weak.noise, seeMates: msg.weak.seeMates });
     else res = searcher.think({
       timeMs: msg.timeMs || 1000, maxDepth: msg.maxDepth || 64, mateNodes: msg.mateNodes || 0,
+      softRatio: msg.softRatio, easyRatio: msg.easyRatio, easyStable: msg.easyStable, mateTimeCap: msg.mateTimeCap,
       onInfo: (info) => post({ type: 'info', id: msg.id, depth: info.depth, score: info.score, mate: info.mate, nodes: info.nodes, time: info.time, pv: info.pv.map(moveToUSI) })
     });
   }
