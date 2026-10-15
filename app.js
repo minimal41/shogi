@@ -13,6 +13,7 @@ const LEVELS = [
   { name: '中級', desc: '3手先まで読み、詰みも見逃しません。手加減は少しだけ。', req: { weak: { depth: 3, noise: 35, seeMates: true }, book: true } },
   { name: '上級', desc: '1手3秒の本気の読み。定跡と詰み探索を使います。', req: { timeMs: 3000, mateNodes: 60000, book: true, ttBits: 20 } },
   { name: '最強', desc: '1手10秒。αβ探索と詰み探索を全力で回す、千里眼の本気です。', req: { timeMs: 10000, mateNodes: 400000, book: true, ttBits: 21 } },
+  { name: '長考', desc: '1手最大30秒。最強の3倍の時間と大きな置換表で、さらに深く読みます。待ち時間は長めです。', req: { timeMs: 30000, mateNodes: 1500000, book: true, ttBits: 22, softRatio: 0.7, easyRatio: 0.5, easyStable: 8, mateTimeCap: 4000 } },
 ];
 const STORE_KEY = 'senrigan-shogi-v1';
 const KANJI = E.KANJI_NUM, ZEN = E.ZEN_NUM;
