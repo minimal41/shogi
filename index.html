@@ -85,6 +85,7 @@
         </fieldset>
         <p class="level-desc" id="levelDesc"></p>
         <label class="toggle"><input type="checkbox" id="optSound" checked> 駒音を鳴らす</label>
+        <label class="toggle" id="explainToggle"><input type="checkbox" id="optExplain"> 指し手の理由を解説する<span class="toggle-note" id="explainNote">（最強・長考）</span></label>
         <button type="button" class="btn primary" id="btnNew" style="width:100%">この設定で新しく対局</button>
       </section>
 
@@ -115,6 +116,11 @@
         <p class="pv" id="pv">まだ読んでいません。あなたが指すと考え始めます。</p>
       </section>
 
+      <section class="sec" aria-labelledby="hWhy" id="whySec" hidden>
+        <div class="sec-head"><h2 id="hWhy">千里眼の考え</h2><span class="why-ply" id="whyPly"></span></div>
+        <div class="why" id="why" aria-live="polite"></div>
+      </section>
+
       <section class="sec" aria-labelledby="hKifu">
         <div class="sec-head"><h2 id="hKifu">棋譜</h2><button type="button" class="link" id="btnCopy">KIF形式でコピー</button></div>
         <ol class="moves" id="moves"></ol>
@@ -129,7 +135,7 @@
       </section>
 
       <section class="sec">
-        <p class="about">千里眼はこのページの中（Web Worker）で動きます。考える時間は「最強」で1手10秒、「長考」で1手最大30秒です。評価関数は、オープンソースの将棋エンジン「やねうら王」（評価関数：水匠ぷち）による約58万局面の形勢判断を教師にして、千里眼独自の評価項目（玉の囲い・駒の働き・攻めの厚みなど約3万項目と、玉の危険度を見る小さなニューラルネット）を学習させたものです。棋譜の指し手を押すと、その局面を振り返れます。入玉宣言法には対応していないため、512手に達した対局は持将棋（引き分け）とします。</p>
+        <p class="about">千里眼はこのページの中（Web Worker）で動きます。考える時間は「最強」で1手10秒、「長考」で1手最大30秒です。評価関数は、オープンソースの将棋エンジン「やねうら王」（評価関数：水匠ぷち）による約58万局面の形勢判断を教師にして、千里眼独自の評価項目（玉の囲い・駒の働き・攻めの厚みなど約3万項目と、玉の危険度を見る小さなニューラルネット）を学習させたものです。「指し手の理由を解説する」をオンにすると、最強・長考で千里眼が指したあと、有力な候補手を同じ深さで読み比べて、その手を選んだ理由を言葉にします。解説の読みは指し手を決めたあと（あなたの手番のあいだ）に行うので、強さや考える時間は変わりません。棋譜の指し手を押すと、その局面を振り返れます。入玉宣言法には対応していないため、512手に達した対局は持将棋（引き分け）とします。</p>
       </section>
     </aside>
   </main>
@@ -137,6 +143,7 @@
 <div class="toast" id="toast" hidden></div>
 
 <script src="engine.js"></script>
+<script src="explain.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

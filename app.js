@@ -12,9 +12,10 @@ const LEVELS = [
   { name: '初級', desc: '目先の駒得を狙ってきます。王手や詰みの筋はあまり読みません。', req: { weak: { depth: 2, noise: 110 }, book: true } },
   { name: '中級', desc: '3手先まで読み、詰みも見逃しません。手加減は少しだけ。', req: { weak: { depth: 3, noise: 35, seeMates: true }, book: true } },
   { name: '上級', desc: '1手3秒の本気の読み。定跡と詰み探索を使います。', req: { timeMs: 3000, mateNodes: 60000, book: true, ttBits: 20 } },
-  { name: '最強', desc: '1手10秒。αβ探索と詰み探索を全力で回す、千里眼の本気です。', req: { timeMs: 10000, mateNodes: 400000, book: true, ttBits: 21 } },
-  { name: '長考', desc: '1手最大30秒。最強の3倍の時間と大きな置換表で、さらに深く読みます。待ち時間は長めです。', req: { timeMs: 30000, mateNodes: 1500000, book: true, ttBits: 22, softRatio: 0.7, easyRatio: 0.5, easyStable: 8, mateTimeCap: 4000 } },
+  { name: '最強', desc: '1手10秒。αβ探索と詰み探索を全力で回す、千里眼の本気です。', req: { timeMs: 10000, mateNodes: 400000, book: true, ttBits: 21 }, explainMs: 3000 },
+  { name: '長考', desc: '1手最大30秒。最強の3倍の時間と大きな置換表で、さらに深く読みます。待ち時間は長めです。', req: { timeMs: 30000, mateNodes: 1500000, book: true, ttBits: 22, softRatio: 0.7, easyRatio: 0.5, easyStable: 8, mateTimeCap: 4000 }, explainMs: 5000 },
 ];
+// explainMs: 指したあと（あなたの手番のあいだ）に、理由を言葉にするための読み比べに使う時間
 const STORE_KEY = 'senrigan-shogi-v1';
 const KANJI = E.KANJI_NUM, ZEN = E.ZEN_NUM;
 const HAND_ORDER = [E.HI, E.KA, E.KI, E.GI, E.KE, E.KY, E.FU];
@@ -36,6 +37,9 @@ let resultHidden = false;
 let justTo = 0;
 let resignArmed = 0;
 let view = null;              // ply shown while reviewing the record (null = live position)
+let why = null;               // explanation still being worked out: { id, ply, base, lastTo, prev, main, started, ms }
+const EXP = window.SenriganExplain;
+const whyMemo = EXP ? new EXP.Memo() : null;   // remembers recent wording so explanations don't repeat themselves
 const posView = new Position();
 function dispPos() { return view === null ? pos : posView; }
 function setView(v) {
@@ -50,12 +54,13 @@ function setView(v) {
 }
 
 function newGame(userSide, level) {
-  return { v: 1, userSide, level, moves: [], evals: [], result: null, flipped: userSide === WHITE, sound: G ? G.sound : true, started: Date.now(), furigoma: false };
+  return { v: 1, userSide, level, moves: [], evals: [], result: null, flipped: userSide === WHITE, sound: G ? G.sound : true,
+    explain: G ? !!G.explain : false, notes: {}, started: Date.now(), furigoma: false };
 }
 
 function rebuild() {
   pos.setSFEN(E.START_SFEN);
-  H = { keys: [pos.key()], checks: [pos.inCheck()], kif: [], kifLines: [], lastTo: 0, froms: [], tos: [] };
+  H = { keys: [pos.key()], checks: [pos.inCheck()], kif: [], kifLines: [], lastTo: 0, froms: [], tos: [], caps: [] };
   const ok = [];
   for (const u of G.moves) {
     const m = pos.parseUSI(u);
@@ -75,7 +80,7 @@ function applyInternal(m) {
   H.kifLines.push(body);
   pos.doMove(m);
   H.lastTo = mTo(m);
-  H.froms.push(mFrom(m)); H.tos.push(mTo(m));
+  H.froms.push(mFrom(m)); H.tos.push(mTo(m)); H.caps.push(E.mCap(m) & 15);
   H.keys.push(pos.key());
   H.checks.push(pos.inCheck());
 }
@@ -126,6 +131,7 @@ function runLocal(msg, purpose) {
   const m2 = Object.assign({}, msg);
   if (m2.timeMs) m2.timeMs = Math.min(m2.timeMs, 2500);
   if (m2.mateNodes) m2.mateNodes = Math.min(m2.mateNodes, 40000);
+  if (m2.explain) m2.explain = { timeMs: Math.min(m2.explain.timeMs, 1200) };   // this runs on the page itself
   setTimeout(() => {
     if (!pending || pending.id !== msg.id) return;
     localSearcher = localSearcher || new E.Searcher(19);
@@ -139,22 +145,30 @@ function ask(purpose, extra) {
   else runLocal(msg, purpose);
 }
 function onEngine(d) {
+  if (d.type === 'explain') { onExplain(d); return; }   // arrives after the move, while you think
   if (!pending || d.id !== pending.id) return;
   if (d.type === 'info') {
     if (pending.purpose === 'ai') { live = d; renderReading(); renderStatus(); }
     return;
   }
   if (d.type !== 'bestmove') return;
-  const purpose = pending.purpose;
+  const { purpose, msg } = pending;
   pending = null;
-  if (purpose === 'ai') onAIMove(d); else onHint(d);
+  if (purpose === 'ai') onAIMove(d, msg); else onHint(d);
+}
+function cancelWhy() {
+  why = null;
+  if (mode === 'worker' && worker) worker.postMessage({ type: 'cancel-explain' });
+  else if (E.cancelExplain) E.cancelExplain(false);
 }
 
 function requestAI() {
   if (G.result || pos.stm === G.userSide) return;
   thinking = true; live = null;
   render();
-  const req = Object.assign({}, LEVELS[G.level].req);
+  const L = LEVELS[G.level];
+  const req = Object.assign({}, L.req);
+  if (G.explain && L.explainMs && EXP) req.explain = { timeMs: L.explainMs };
   startThinkBar(req.timeMs ? (mode === 'local' ? Math.min(req.timeMs, 2500) : req.timeMs) : 0);
   ask('ai', req);
 }
@@ -170,7 +184,7 @@ function startThinkBar(ms) {
 
 function scoreForBlack(score, side) { return side === BLACK ? score : -score; }
 
-function onAIMove(d) {
+function onAIMove(d, msg) {
   thinking = false;
   const aiSide = G.userSide ^ 1;
   const ply = G.moves.length;
@@ -187,12 +201,39 @@ function onAIMove(d) {
   }
   const m = pos.parseUSI(d.move);
   if (!m) { finish({ winner: G.userSide, reason: '投了', by: aiSide }); return; }
+  const prev = ply > 0 ? { from: H.froms[ply - 1], to: H.tos[ply - 1], cap: H.caps[ply - 1], k: H.kif[ply - 1] } : null;
+  const base = reading.base, lastTo = H.lastTo;
   G.moves.push(d.move);
   applyInternal(m);
   justTo = mTo(m);
+  if (msg && msg.explain) startWhy(d, ply, base, lastTo, prev, msg.explain.timeMs);
   clack();
   afterMove();
 }
+
+// ---------------------------------------------------------------- why this move (explanations)
+function startWhy(d, ply, base, lastTo, prev, ms) {
+  const main = { move: d.move, score: d.score, depth: d.depth, pv: d.pv, book: d.book, dfpn: d.dfpn, mate: d.mate };
+  why = null;
+  if (d.book) { storeWhy({ ply, base, lastTo, prev, main }, null); return; }   // no reading to compare for a book move
+  why = { id: d.id, ply, base, lastTo, prev, main, started: Date.now(), ms };
+}
+function onExplain(d) {
+  if (!why || d.id !== why.id) return;
+  const w = why;
+  why = null;
+  storeWhy(w, d.data);
+  renderWhy(); renderMoves();
+}
+function storeWhy(w, data) {
+  if (G.moves[w.ply] !== w.main.move) return;   // taken back in the meantime
+  let note = null;
+  try { note = EXP.build({ base: w.base, lastTo: w.lastTo, prev: w.prev, ply: w.ply, data, main: w.main }, whyMemo); } catch (e) { note = null; }
+  G.notes[w.ply] = note ? { head: note.head, paras: note.paras, rows: note.rows, foot: note.foot }
+    : { head: '', paras: ['この手の理由はうまく言葉にできませんでした。'], rows: [], foot: '' };
+  save();
+}
+function isAIPly(i) { return (i % 2 === 0 ? BLACK : WHITE) !== G.userSide; }
 
 function onHint(d) {
   if (!hint || !hint.loading) return;
@@ -269,6 +310,8 @@ function startNew() {
   G = newGame(side, level);
   G.furigoma = furi;
   G.sound = $('optSound').checked;
+  G.explain = $('optExplain').checked;
+  cancelWhy();
   thinking = false; live = null; reading = null; hint = null; sel = null; promoPending = null; view = null;
   rebuild();
   save();
@@ -296,6 +339,8 @@ function undo() {
     }
   }
   G.evals = G.evals.filter(e => e.ply < G.moves.length);
+  for (const k of Object.keys(G.notes)) if (Number(k) >= G.moves.length) delete G.notes[k];
+  if (why && why.ply >= G.moves.length) cancelWhy();
   rebuild();
   sel = null;
   save();
@@ -471,6 +516,7 @@ function render() {
   renderButtons();
   renderEval();
   renderReading();
+  renderWhy();
   renderMoves();
   renderResult();
   syncSetup();
@@ -675,6 +721,56 @@ function renderReading() {
   pvEl.append(ks.length ? '読み筋：' + ks.join(' ') : '—');
 }
 
+// 千里眼の考え：見ている局面までで最後の千里眼の手について、選んだ理由を出す
+function renderWhy() {
+  const sec = $('whySec'), box = $('why');
+  const shown = view === null ? G.moves.length : view;
+  let ply = -1;
+  for (let i = shown - 1; i >= 0; i--) if (isAIPly(i)) { ply = i; break; }
+  const note = ply >= 0 ? G.notes[ply] : null;
+  const waiting = !!(why && why.ply === ply);
+  const on = !!(EXP && G.explain && LEVELS[G.level].explainMs);
+  sec.hidden = !(on || note || waiting);
+  if (sec.hidden) return;
+  $('whyPly').textContent = (note || waiting) ? `${ply + 1}手目` : '';
+  box.textContent = '';
+  if (waiting) {
+    const p = document.createElement('p'); p.className = 'why-wait';
+    p.append(`${H.kif[ply]}を選んだ理由を、ほかの候補と読み比べながら整理しています…`);
+    const bar = document.createElement('div'); bar.className = 'why-bar';
+    const fill = document.createElement('span');
+    fill.style.animationDuration = why.ms + 'ms';
+    fill.style.animationDelay = -(Date.now() - why.started) + 'ms';
+    bar.append(fill);
+    box.append(p, bar);
+    return;
+  }
+  if (!note) {
+    const p = document.createElement('p'); p.className = 'why-wait';
+    p.textContent = thinking ? '千里眼が指したら、その手を選んだ理由をここに書きます。' : '千里眼が指すと、その手を選んだ理由と、ほかの候補手との比較をここに書きます。';
+    box.append(p);
+    return;
+  }
+  for (const t of note.paras) { const p = document.createElement('p'); p.textContent = t; box.append(p); }
+  if (note.rows && note.rows.length) {
+    const tb = document.createElement('table'); tb.className = 'cands';
+    const cap = document.createElement('caption'); cap.textContent = '読み比べた候補手';
+    const head = document.createElement('tr');
+    for (const h of ['候補手', '評価値', '読み筋']) { const th = document.createElement('th'); th.scope = 'col'; th.textContent = h; head.append(th); }
+    tb.append(cap, head);
+    for (const r of note.rows) {
+      const tr = document.createElement('tr'); if (r.chosen) tr.className = 'chosen';
+      const a = document.createElement('td'); a.className = 'mv'; a.textContent = r.k;
+      if (r.chosen) { const b = document.createElement('span'); b.className = 'tag'; b.textContent = '採用'; a.append(b); }
+      const ev = document.createElement('td'); ev.className = 'ev'; ev.textContent = r.ev;
+      const ln = document.createElement('td'); ln.className = 'line'; ln.textContent = r.line || '—';
+      tr.append(a, ev, ln); tb.append(tr);
+    }
+    box.append(tb);
+  }
+  if (note.foot) { const f = document.createElement('p'); f.className = 'why-foot'; f.textContent = note.foot; box.append(f); }
+}
+
 function renderMoves() {
   const ol = $('moves');
   ol.innerHTML = '';
@@ -694,6 +790,7 @@ function renderMoves() {
     const btn = document.createElement('button');
     btn.type = 'button'; btn.dataset.ply = String(i + 1);
     if (i === shown - 1) { li.className = 'cur'; curEl = li; btn.setAttribute('aria-current', 'true'); }
+    if (G.notes[i]) { li.classList.add('noted'); btn.title = '千里眼の考えあり'; }
     const n = document.createElement('span'); n.className = 'n'; n.textContent = String(i + 1);
     const mv = document.createElement('span'); mv.className = 'mv'; mv.textContent = k;
     btn.append(n, mv);
@@ -733,7 +830,11 @@ function syncSetup() {
   $('optSound').checked = G.sound !== false;
   const lv = document.querySelector(`input[name="level"][value="${G.level}"]`);
   if (lv && !lv.checked) lv.checked = true;
-  $('levelDesc').textContent = LEVELS[Number(document.querySelector('input[name="level"]:checked').value)].desc;
+  const L = LEVELS[Number(document.querySelector('input[name="level"]:checked').value)];
+  $('levelDesc').textContent = L.desc;
+  $('optExplain').checked = !!G.explain;
+  $('optExplain').disabled = !L.explainMs;
+  $('explainNote').textContent = L.explainMs ? '（最強・長考）' : '（最強・長考で使えます）';
 }
 
 // ---------------------------------------------------------------- KIF export
@@ -749,7 +850,11 @@ function buildKif() {
     `後手：${G.userSide === WHITE ? 'あなた' : '千里眼（' + lv + '）'}`,
     '手数----指手---------消費時間--',
   ];
-  H.kifLines.forEach((k, i) => lines.push(`${String(i + 1).padStart(4)} ${k}   ( 0:00/00:00:00)`));
+  H.kifLines.forEach((k, i) => {
+    lines.push(`${String(i + 1).padStart(4)} ${k}   ( 0:00/00:00:00)`);
+    const n = G.notes[i];   // 千里眼の考えは KIF のコメント行（*）として残す
+    if (n && n.paras) for (const p of n.paras) lines.push('*' + p);
+  });
   if (G.result) {
     const n = G.moves.length + 1;
     const r = G.result;
@@ -814,6 +919,7 @@ function buildLevelSeg() {
     const v = Number(e.target.value);
     $('levelDesc').textContent = LEVELS[v].desc;
     if (G && !G.result) { G.level = v; save(); toast(`次の手から「${LEVELS[v].name}」で指します`); }
+    if (G) { syncSetup(); renderWhy(); }
   });
 }
 function sizeVars() {
@@ -826,6 +932,8 @@ function boot(data) {
   const restored = data && data.G && data.G.v === 1 ? data.G : load();
   G = restored || newGame(BLACK, 4);
   if (typeof G.level !== 'number' || !LEVELS[G.level]) G.level = 4;
+  if (!G.notes || typeof G.notes !== 'object') G.notes = {};
+  if (!EXP) $('explainToggle').hidden = true;
   document.querySelector(`input[name="side"][value="${G.userSide === WHITE ? '1' : '0'}"]`).checked = true;
   document.querySelector(`input[name="level"][value="${G.level}"]`).checked = true;
   buildBoard();
@@ -852,6 +960,12 @@ function boot(data) {
   $('btnCopy').addEventListener('click', copyKif);
   $('btnCopy2').addEventListener('click', copyKif);
   $('optSound').addEventListener('change', (e) => { G.sound = e.target.checked; save(); });
+  $('optExplain').addEventListener('change', (e) => {
+    G.explain = e.target.checked;
+    if (!G.explain) cancelWhy();
+    save(); render();
+    if (G.explain && LEVELS[G.level].explainMs) toast(thinking ? '次に千里眼が指す手から、理由を表示します' : '千里眼が指すと、その手を選んだ理由を表示します');
+  });
   $('moves').addEventListener('click', (e) => { const b = e.target.closest('button[data-ply]'); if (b) setView(Number(b.dataset.ply)); });
   $('navFirst').addEventListener('click', () => setView(0));
   $('navPrev').addEventListener('click', () => setView((view === null ? G.moves.length : view) - 1));

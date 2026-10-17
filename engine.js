@@ -210,6 +210,15 @@ class Position {
     return p;
   }
 
+  // Exact copy including the move history (repetition detection needs it)
+  copyFrom(o) {
+    this.board.set(o.board); this.hand.set(o.hand); this.kingSq.set(o.kingSq); this.pawnMask.set(o.pawnMask);
+    this.stm = o.stm; this.hashLo = o.hashLo; this.hashHi = o.hashHi; this.material = o.material; this.ply = o.ply;
+    this.histLo.set(o.histLo); this.histHi.set(o.histHi); this.histMat.set(o.histMat);
+    this.histMove.set(o.histMove); this.histCheck.set(o.histCheck);
+    return this;
+  }
+
   setSFEN(sfen) {
     const parts = sfen.trim().split(/\s+/);
     const b = this.board;
@@ -1368,6 +1377,27 @@ function evaluate(pos) {
 }
 function setWeights(arr) { for (let i = 0; i < NPARAMS && i < arr.length; i++) WT[i] = arr[i]; }
 
+// The evaluation split into parts that can be put into words (black's view; the parts sum to
+// evaluate() for black). kingB: black king's safety, kingW: danger to white's king.
+function evalParts(pos) {
+  const F = EVAL_BUF, n = extractFeatures(pos, F);
+  let mat = 0, place = 0, kingB = 0, kingW = 0, mob = 0, threat = 0, tempo = 0;
+  for (let i = 0; i < n; i++) {
+    const x = F[i], black = x >= 0, idx = black ? x : ~x, w = black ? WT[idx] : -WT[idx];
+    if (idx < F_PST) mat += w;
+    else if (idx < F_OWNK) { if (((idx - F_PST) / 45 | 0) === OU) { if (black) kingB += w; else kingW += w; } else place += w; }
+    else if (idx < F_ENEK) { if (black) kingB += w; else kingW += w; }     // defenders around their own king
+    else if (idx < F_MOB) { if (black) kingW += w; else kingB += w; }      // attackers near the enemy king
+    else if (idx < F_KS_A) mob += w;
+    else if (idx < F_HANG_S) { if (black) kingB += w; else kingW += w; }   // king-safety counts
+    else if (idx === F_TEMPO) tempo += w;
+    else threat += w;                                                      // hanging / threatened pieces
+  }
+  let nn = 0;
+  if (NN_ON) { denseFeatures(pos, DENSE_BUF); nn = Math.round(nnHalf(DENSE_BUF, 0) - nnHalf(DENSE_BUF, ND)); }
+  return { mat, place, kingB, kingW, mob, threat, tempo, nn };
+}
+
 // ---------------------------------------------------------------------------
 // Transposition table
 // ---------------------------------------------------------------------------
@@ -1413,6 +1443,22 @@ class TTable {
     if (move !== 0) this.move[i] = move;
     this.key[i] = hi; this.score[i] = score; this.ev[i] = ev; this.depth[i] = depth;
     this.flag[i] = bound | (this.age << 2);
+  }
+}
+// Reads through to `base` but writes only to its own entries: lets the explanation search reuse what
+// the main search learned without changing a single entry of the main table.
+class OverlayTT extends TTable {
+  constructor(base, bits) { super(bits); this.base = base; }
+  probe(lo, hi) {
+    const i = super.probe(lo, hi);
+    if (i >= 0 || !this.base) return i;
+    const b = this.base, j = b.probe(lo, hi);
+    if (j < 0) return -1;
+    const i0 = (lo & this.mask) & ~1;
+    const k = this.flag[i0] === 0 ? i0 : this.flag[i0 + 1] === 0 ? i0 + 1 : (this.depth[i0] <= this.depth[i0 + 1] ? i0 : i0 + 1);
+    this.key[k] = hi; this.move[k] = b.move[j]; this.score[k] = b.score[j]; this.ev[k] = b.ev[j]; this.depth[k] = b.depth[j];
+    this.flag[k] = (b.flag[j] & 3) | (this.age << 2);
+    return k;
   }
 }
 function valueToTT(v, ply) { return v >= MATE_IN_MAX ? v + ply : v <= -MATE_IN_MAX ? v - ply : v; }
@@ -1619,6 +1665,7 @@ class Searcher {
     this.mateBuf = new Int32Array(700);
     this.ecLo = new Int32Array(1 << 16); this.ecHi = new Int32Array(1 << 16); this.ecVal = new Int16Array(1 << 16);
     this.nodes = 0; this.stopped = false; this.deadline = Infinity; this.nodeLimit = Infinity;
+    this.rootEffort = new Map();   // nodes spent on each root move (for explanations)
     this.contempt = 40; this.rootSide = 0; this.repLimit = 32;
     this.useMate1 = false;
     this.mate1Depth = 2;
@@ -1991,6 +2038,7 @@ class Searcher {
       }
       legal++;
       this.curMove[ply] = m;
+      const n0 = this.nodes;
       let ext = 0;
       if (gives && ply < 2 * this.rootDepth && (depth <= 3 || this.seeAfterOk(m))) ext = 1;
       const newDepth = depth - 1 + ext;
@@ -2017,7 +2065,7 @@ class Searcher {
       }
       pos.undoMove(m);
       if (this.stopped) return 0;
-      if (rootNode) this.rootScores.set(m, v);
+      if (rootNode) { this.rootScores.set(m, v); this.rootEffort.set(m, (this.rootEffort.get(m) || 0) + this.nodes - n0); }
       if (v > bestScore) {
         bestScore = v;
         if (v > alpha) {
@@ -2090,6 +2138,7 @@ class Searcher {
     this.deadline = t0 + timeMs;
     this.nodeLimit = opts.nodes || Infinity;
     this.rootSide = pos.stm;
+    this.rootEffort = new Map();
     this.killers.fill(0);
     for (let i = 0; i < this.hist.length; i++) this.hist[i] = this.hist[i] >> 1;
     const inCheck = pos.inCheck();
@@ -2132,6 +2181,8 @@ class Searcher {
     let bestMove = rootMoves[0], bestScore = 0, prevScore = 0;
     const soft = opts.analyze ? timeMs : timeMs * (opts.softRatio || 0.55);
     let stableCount = 0;
+    const iters = [];                 // best move and score after each finished depth (for explanations)
+    result.iters = iters; result.effort = this.rootEffort;
     for (let depth = 1; depth <= maxDepth; depth++) {
       this.rootDepth = depth;
       this.rootScores = new Map();
@@ -2157,6 +2208,7 @@ class Searcher {
       stableCount = newBest === bestMove ? stableCount + 1 : 0;
       bestMove = newBest; bestScore = score; prevScore = score;
       result.depth = depth; result.pv = pv.length ? pv : [bestMove];
+      iters.push({ depth, move: newBest, score });
       const el = now() - t0;
       if (opts.onInfo) opts.onInfo({ depth, score, nodes: this.nodes, pv: result.pv, time: el, mate: score >= MATE_IN_MAX ? MATE - score : score <= -MATE_IN_MAX ? -(MATE + score) : 0 });
       if (Math.abs(score) >= MATE_IN_MAX && depth > (MATE - Math.abs(score)) + 4) break;
@@ -2267,9 +2319,200 @@ setNN({ W1: NN_W1_DATA, B1: NN_B1_DATA, W2: NN_W2_DATA });
 Object.assign(api, { denseFeatures, setNN, ND, NH, evaluate, evaluateHand, extractFeatures, setWeights, defaultWeights, WT, FEAT, NPARAMS, Searcher, DfPn, TTable, bookMove, buildBook, BOOK_LINES, MATE, MATE_IN_MAX, INF, EVAL_PARAMS });
 
 // ---------------------------------------------------------------------------
+// Explanation analysis: why the chosen move beat the other candidates.
+// It starts only after the move has been sent and runs in short slices, on a searcher of its own
+// that reads the main search's table through an overlay and never writes to the main searcher's
+// state — so the move, its strength and its thinking time are exactly what they would be without it.
+// ---------------------------------------------------------------------------
+const EX_SLICE_MS = 120, EX_CANDS = 5;
+const EX_COPY = ['contempt', 'repLimit', 'useMate1', 'mate1Depth', 'qsChecks', 'lmpImpBase', 'lmpImpMul', 'lmpBase', 'lmpMul', 'futBase', 'futMul', 'rfpMul'];
+const SEE_CTX = { pos: null, seeGain: new Int32Array(64), seeSq: new Int32Array(64), seePc: new Int32Array(64), leastAttacker: Searcher.prototype.leastAttacker };
+function seeMove(pos, m) { SEE_CTX.pos = pos; return Searcher.prototype.see.call(SEE_CTX, m); }
+
+// Squares the piece on `s` attacks
+function attacksFrom(pos, s) {
+  const b = pos.board, p = b[s], out = [];
+  if (p === 0 || p === WALL) return out;
+  const st = STEP_LIST[(p >> 4) * 16 + (p & 15)], sl = SLIDE_LIST[(p >> 4) * 16 + (p & 15)];
+  for (let j = 0; j < st.length; j++) { const q = s + st[j]; if (q >= 0 && q < NSQ && b[q] !== WALL) out.push(q); }
+  for (let j = 0; j < sl.length; j++) { let q = s + sl[j]; while (b[q] !== WALL) { out.push(q); if (b[q] !== 0) break; q += sl[j]; } }
+  return out;
+}
+
+function legalRoot(pos) {
+  const buf = new Int32Array(700);
+  const n = pos.inCheck() ? pos.genEvasions(buf, 0, false) : pos.gen(buf, 0, 7);
+  const out = [];
+  for (let i = 0; i < n; i++) if (pos.isLegal(buf[i])) out.push(buf[i]);
+  return out;
+}
+function pvAt(s, ply) { const out = []; for (let j = ply; j < s.pvLen[ply]; j++) out.push(s.pvTable[ply * MAX_SPLY + j]); return out; }
+
+let exJob = null;
+function cancelExplain(flush) {
+  const j = exJob;
+  if (!j) return;
+  exJob = null; j.cancelled = true;
+  if (flush) exPublish(j, true);
+}
+
+function startExplain(main, res, msg, post) {
+  cancelExplain(false);
+  let ex = main.explainer;
+  if (!ex) { ex = main.explainer = new Searcher(1); ex.tt = new OverlayTT(main.tt, 19); ex.dfpn = new DfPn(16); }
+  ex.tt.base = main.tt; ex.tt.age = (ex.tt.age + 1) & 63;
+  for (const k of EX_COPY) ex[k] = main[k];
+  if (ex.lmrDiv !== main.lmrDiv) ex.setLmrDiv(main.lmrDiv);
+  ex.hist.set(main.hist); ex.counter.set(main.counter); ex.killers.set(main.killers);
+  ex.pos.copyFrom(main.pos);
+  ex.rootSide = ex.pos.stm; ex.nodes = 0; ex.nodeLimit = Infinity;
+  ex.dfpn.clear();
+  const t0 = now(), budget = Math.max(300, msg.explain.timeMs || 3000);
+  const job = { ex, res, id: msg.id, post, t0, budget, end: t0 + budget, sliceEnd: 0, cancelled: false,
+    depth: 0, rootMoves: [], inCheck: ex.pos.inCheck(), cands: [{ m: res.move }], rootThreat: null, moveThreat: null };
+  job.gen = explainSteps(job);
+  exJob = job;
+  setTimeout(() => exSlice(job), 0);
+}
+
+function exSlice(job) {
+  if (job.cancelled) return;
+  job.sliceEnd = now() + EX_SLICE_MS;
+  for (;;) {
+    if (job.gen.next().done) { if (exJob === job) exJob = null; exPublish(job, false); return; }
+    if (now() >= job.sliceEnd) break;
+  }
+  setTimeout(() => exSlice(job), 0);
+}
+
+// Runs one search of the job. If the time slice ends first, it is retried in the next slice
+// (the table keeps the work already done). Gives null once the phase's own time is up.
+function* exRun(job, phaseEnd, fn) {
+  const ex = job.ex, end = Math.min(phaseEnd, job.end);
+  for (;;) {
+    ex.stopped = false;
+    ex.deadline = Math.min(end, job.sliceEnd);
+    const v = fn();
+    if (!ex.stopped) return v;
+    if (now() >= end) return null;
+    yield;
+  }
+}
+
+function exChild(ex, m, d, a, b) {
+  const pos = ex.pos;
+  pos.doMove(m);
+  ex.curMove[0] = m; ex.rootDepth = d;
+  const v = d <= 1 ? -ex.qsearch(-b, -a, 1, 0) : -ex.search(-b, -a, d - 1, 1, false);
+  pos.undoMove(m);
+  return v;
+}
+
+// Exact score and line of one candidate at depth d (aspiration around its previous score)
+function* exAspire(job, c, d) {
+  let delta = 40, a = -INF, b = INF;
+  if (d >= 3 && c.last !== undefined && Math.abs(c.last) < MATE_IN_MAX) { a = c.last - delta; b = c.last + delta; }
+  for (;;) {
+    const v = yield* exRun(job, job.end, () => exChild(job.ex, c.m, d, a, b));
+    if (v === null) return null;
+    if (v <= a) a = Math.max(-INF, v - delta);
+    else if (v >= b) b = Math.min(INF, v + delta);
+    else { c.cur = { v, pv: [c.m].concat(pvAt(job.ex, 1)) }; return v; }
+    delta += delta;
+    if (delta > 1000) { a = -INF; b = INF; }
+  }
+}
+
+// What the side to move could do if the other side passed: after `m` (our move) it is our threat,
+// with m = 0 at the root it is the opponent's threat against us.
+function* exThreat(job, m, phaseEnd) {
+  const ex = job.ex, pos = ex.pos;
+  if (m) pos.doMove(m);
+  pos.doNull();
+  ex.curMove[0] = 0;
+  const st = ex.evaluate();
+  let best = null;
+  for (let d = 1; d <= 8; d++) {
+    ex.rootDepth = d;
+    const v = yield* exRun(job, phaseEnd, () => ex.search(-INF, INF, d, 1, false));
+    if (v === null) break;
+    best = { pv: pvAt(ex, 1), v };
+    if (Math.abs(v) >= MATE_IN_MAX) break;
+  }
+  let mate = 0;
+  if (best && !pos.inCheck() && ex.dfpn.solve(pos, 20000, Math.max(20, Math.min(150, phaseEnd - now())), 31)) mate = ex.dfpn.pv(31).length || 1;
+  pos.undoNull();
+  if (m) pos.undoMove(m);
+  return best && { pv: best.pv, v: best.v, st, mate };
+}
+
+function* explainSteps(job) {
+  const ex = job.ex, pos = ex.pos, res = job.res, M = res.move, iters = res.iters || [];
+  const roots = job.rootMoves = legalRoot(pos);
+  if (roots.length <= 1 || res.dfpn || Math.abs(res.score) >= MATE_IN_MAX || roots.indexOf(M) < 0) return;
+  // 1. every legal move at a glance (captures resolved): shows which moves look tempting
+  const sh = new Map();
+  yield* exRun(job, job.end, () => {
+    for (const m of roots) {
+      if (sh.has(m)) continue;
+      pos.doMove(m); ex.curMove[0] = m;
+      const v = -ex.qsearch(-INF, INF, 1, 0);
+      pos.undoMove(m);
+      if (ex.stopped) break;
+      sh.set(m, v);
+    }
+    return 0;
+  });
+  // 2. candidates: the chosen move, the moves the main search worked hardest to refute,
+  //    its earlier favourites and the moves that look best at a glance
+  const eff = res.effort || new Map();
+  let total = 0;
+  for (const v of eff.values()) total += v;
+  const pick = [M];
+  const add = (m) => { if (m && pick.length < EX_CANDS && pick.indexOf(m) < 0 && roots.indexOf(m) >= 0) pick.push(m); };
+  const byEffort = roots.filter(m => m !== M).sort((a, b) => (eff.get(b) || 0) - (eff.get(a) || 0) || (sh.get(b) || 0) - (sh.get(a) || 0));
+  add(byEffort[0]); add(byEffort[1]);
+  for (let i = iters.length - 1, k = 0; i >= 0 && k < 2; i--) if (iters[i].depth >= 4 && iters[i].move !== M && pick.indexOf(iters[i].move) < 0) { add(iters[i].move); k++; }
+  const byGlance = roots.filter(m => m !== M).sort((a, b) => (sh.get(b) || -INF) - (sh.get(a) || -INF));
+  for (let i = 0, k = 0; i < byGlance.length && k < 2; i++) {
+    const m = byGlance[i];
+    if (pick.indexOf(m) < 0 && sh.has(m) && sh.get(m) >= (sh.get(M) || 0) - 80) { add(m); k++; }
+  }
+  for (const m of byEffort) add(m);
+  job.cands = pick.map(m => ({ m, sh: sh.has(m) ? sh.get(m) : null, ef: total ? (eff.get(m) || 0) / total : 0 }));
+  yield;
+  // 3. the opponent's threat against us, and what our move threatens
+  if (!job.inCheck) job.rootThreat = yield* exThreat(job, 0, now() + job.budget * 0.08);
+  if (!pos.givesCheck(M)) job.moveThreat = yield* exThreat(job, M, now() + job.budget * 0.08);
+  // 4. every candidate read to the same depth (exact score and line), deeper until the time is up
+  const maxD = Math.max(2, Math.min(res.depth || 64, MAX_SPLY - 12));
+  for (let d = 1; d <= maxD; d++) {
+    for (const c of job.cands) {
+      if ((yield* exAspire(job, c, d)) === null) return;
+      yield;
+    }
+    for (const c of job.cands) { c.done = c.cur; c.last = c.cur.v; }
+    job.depth = d;
+    if (now() >= job.end) return;
+  }
+}
+
+function exPublish(job, partial) {
+  const u = moveToUSI, res = job.res;
+  const thr = (t) => t && { pv: t.pv.map(u), v: t.v, st: t.st, mate: t.mate };
+  job.post({ type: 'explain', id: job.id, partial, data: {
+    depth: job.depth, mainDepth: res.depth, mainScore: res.score, mate: res.mate, dfpn: !!res.dfpn,
+    legal: job.rootMoves.length, inCheck: job.inCheck, chosen: u(res.move), mainPv: res.pv.map(u),
+    iters: (res.iters || []).map(it => [it.depth, u(it.move), it.score]),
+    cands: job.cands.map(c => ({ m: u(c.m), s: c.done ? c.done.v : null, pv: c.done ? c.done.pv.map(u) : [], sh: c.sh, ef: c.ef })),
+    rootThreat: thr(job.rootThreat), moveThreat: thr(job.moveThreat), nodes: job.ex.nodes, time: Math.round(now() - job.t0) } });
+}
+
+// ---------------------------------------------------------------------------
 // Request handling (shared by the Web Worker and the main-thread fallback)
 // ---------------------------------------------------------------------------
 function handleGo(searcher, msg, post) {
+  cancelExplain(true);   // a new request ends an explanation still in progress (sending what it has)
   const pos = searcher.pos;
   pos.setSFEN(msg.sfen || START_SFEN);
   for (const u of (msg.moves || [])) {
@@ -2286,14 +2529,16 @@ function handleGo(searcher, msg, post) {
   if (!res) {
     if (msg.weak) res = searcher.thinkWeak({ depth: msg.weak.depth, noise: msg.weak.noise, seeMates: msg.weak.seeMates });
     else res = searcher.think({
-      timeMs: msg.timeMs || 1000, maxDepth: msg.maxDepth || 64, mateNodes: msg.mateNodes || 0,
+      timeMs: msg.timeMs || 1000, maxDepth: msg.maxDepth || 64, mateNodes: msg.mateNodes || 0, nodes: msg.nodes,
       softRatio: msg.softRatio, easyRatio: msg.easyRatio, easyStable: msg.easyStable, mateTimeCap: msg.mateTimeCap,
       onInfo: (info) => post({ type: 'info', id: msg.id, depth: info.depth, score: info.score, mate: info.mate, nodes: info.nodes, time: info.time, pv: info.pv.map(moveToUSI) })
     });
   }
   post({ type: 'bestmove', id: msg.id, move: res.move ? moveToUSI(res.move) : 'resign', score: res.score, mate: res.mate, depth: res.depth, nodes: res.nodes, time: res.time, pv: res.pv.map(moveToUSI), book: !!res.book, dfpn: !!res.dfpn });
+  // only now, with the move already sent, work out why it was chosen
+  if (msg.explain && res.move && !res.book && !msg.weak) startExplain(searcher, res, msg, post);
 }
-api.handleGo = handleGo;
+Object.assign(api, { handleGo, cancelExplain, evalParts, seeMove, attacksFrom, OverlayTT });
 
 if (typeof importScripts === 'function' && typeof document === 'undefined' && typeof self !== 'undefined') {
   let searcher = null;
@@ -2302,6 +2547,8 @@ if (typeof importScripts === 'function' && typeof document === 'undefined' && ty
     if (msg.type === 'go') {
       if (!searcher || (msg.ttBits && searcher.tt.size !== (1 << msg.ttBits))) searcher = new Searcher(msg.ttBits || 20);
       handleGo(searcher, msg, (x) => self.postMessage(x));
+    } else if (msg.type === 'cancel-explain') {
+      cancelExplain(false);
     } else if (msg.type === 'ping') {
       self.postMessage({ type: 'pong' });
     }
