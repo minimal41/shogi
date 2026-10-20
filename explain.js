@@ -541,6 +541,8 @@ function context(inp, memo) {
   // 動かした駒を相手がすぐに取る（読み筋の応手。読み筋がなければ、ただで取られる形）なら、その駒の次の狙いは言わない
   X.takenNow = X.R ? !!(X.R.cap && X.R.to === X.Mi.to) : X.Mi.exposed.some(e => e.s === X.Mi.to);
   if (X.mt && ((X.R && X.R.cap && mFrom(X.mt.T) && X.R.to === mFrom(X.mt.T)) || (X.takenNow && mFrom(X.mt.T) === X.Mi.to))) X.mt.real = false;
+  // この手そのものが攻めの手か（王手・成り・次の狙い・駒への当たり）。攻めながら駒をかわす手を「受け」とは言わない
+  X.attacking = X.Mi.check || (X.Mi.promo && !X.takenNow) || !!(X.mt && X.mt.real) || X.Mi.threats.some(t => t.g >= 300 && X.Mi.hits.some(h => h.s === t.s));
   if (X.rt && X.rt.real) X.rtHandled = handled(X);
   X.tempo = tempoNote(X, inp.hist);
   // 候補手
@@ -586,15 +588,17 @@ function kifLine(pos, usis, prevTo) {
   return out;
 }
 
-// この手が相手の狙いを消しているか（詰めろなら、深い読みで詰まされていないこと）
+// この手が相手の狙いを消しているか、どうやって消しているか（詰めろなら、深い読みで詰まされていないこと）。
+// took：狙いの駒を取った、moved：狙われていた駒を動かした、blocked：利きを止めた、guarded：紐をつけた
 function handled(X) {
   const T = X.rt, I = X.Mi;
   if (T.mate) return !isMate(X.score) || X.score > 0 ? 'mate' : false;
   if ([1, 3, 5].some(i => X.L.moves[i] === T.T)) return false;
+  if (mFrom(T.T) && I.to === mFrom(T.T)) return 'took';
+  const target = T.cap ? T.cap.s : T.I.threats.length ? T.I.threats[0].s : 0;
+  if (I.from && target && I.from === target) return 'moved';
   if (!T.cap) return X.L.moves.length < 2 || X.L.moves[1] !== T.T ? 'other' : false;
   const s = T.cap.s;
-  if (mFrom(T.T) && I.to === mFrom(T.T)) return 'took';
-  if (I.from === s && I.fled) return 'fled';
   if (mFrom(T.T) && I.blocks.some(b => b.s === mFrom(T.T))) return 'blocked';
   if (I.saved.some(x => x.s === s)) return 'guarded';
   return X.L.moves.length >= 2 && X.L.moves[1] !== T.T && !(mTo(X.L.moves[1]) === s && mCap(X.L.moves[1])) ? 'other' : false;
@@ -624,24 +628,29 @@ function replyTe(R, prev) {
 }
 // 取られる駒の名前。読み筋の途中で成った駒は、いま盤上にある姿（成る前の名前）で呼ぶ
 const capName = (L, x) => (x.board !== x.t && L.promos.some(p => !p.mine && p.s === x.s && p.ply < x.ply) ? NAME[x.t] : NAME[x.board]);
-// 狙いの中身を動詞句で（「△５五角で金を取る」「▲４五歩で角に当てる」など）と、その名詞句（「〜手」「〜筋」）
+// 狙いの中身を動詞句で（「△５五角で４四の金を取る」「▲１四歩△同歩のあと、▲同香で香車を取る」など）と、
+// その名詞句（「〜手」「〜筋」）。あとで駒を取る筋は、取るところまでの手順を見せる（どう狙っているかがわかるように）
 function threatVerb(T) {
-  const L = T.L, I = T.I, cap = T.cap, big = I.threats.filter(x => x.g >= 300);
+  const L = T.L, I = T.I, cap = T.cap, big = I.threats.filter(x => x.g >= 300), k = L.kifs;
   const pr = L.promos.find(x => x.mine && x.kept && x.ply <= 2);
+  const upTo = (j) => (j <= 0 ? T.k : `${k.slice(0, j).join('')}のあと、${k[j]}`);   // j 手目がその狙いの決め手
+  const pair = (a, b) => (a.t === b.t ? `二枚の${NAME[a.t]}` : `${NAME[a.t]}と${NAME[b.t]}`);
   if (I.cap && I.cap !== FU) return [`${T.k}で${NAME[I.cap]}を取る`, '手'];
-  if (!I.cap && big.length >= 2) return [`${T.k}で両取りをかける`, '手'];
-  if (pr && pr.ply === 0) return [`${T.k}で${NAME[pr.t]}を作る`, '手'];
-  if (!I.cap && big.length) return [`${T.k}で${NAME[big[0].t]}に当てる`, '手'];
-  if (pr) return [`${T.k}から${NAME[pr.t]}を作る`, '筋'];
-  if (cap && cap.t !== FU) return [`${T.k}から${capName(L, cap)}を取る`, '筋'];
-  const w = matWords(L, Math.min(L.horizon, 4)), top = w.g.filter(t => t !== FU).sort((a, b) => HV[b] - HV[a])[0];
-  if (w.net >= 150 && top) return [`${T.k}から${NAME[top]}を取る`, '筋'];
-  if (w.net >= 150) return [`${T.k}から駒得を図る`, '筋'];
-  return [`${T.k}から攻める`, '筋'];
+  if (!I.cap && big.length >= 2) return [`${T.k}で${pair(big[0], big[1])}の両取りをかける`, '手'];
+  if (pr && pr.ply === 0) return [`${T.k}と成って${NAME[pr.t]}を作る`, '手'];
+  if (!I.cap && big.length) return [`${T.k}で${sqName(big[0].s)}の${NAME[big[0].t]}に当てる`, '手'];
+  if (pr) return [`${upTo(pr.ply)}で${NAME[pr.t]}を作る`, '筋'];
+  if (cap && cap.t !== FU && cap.ply <= 4) return [`${upTo(cap.ply)}で${capName(L, cap)}を取る`, '筋'];
+  const lim = Math.min(L.horizon, 4), w = matWords(L, lim), top = w.g.filter(t => t !== FU).sort((a, b) => HV[b] - HV[a])[0];
+  const lastGot = (t) => L.got.filter(x => x.ply <= lim && (t == null || x.t === t)).reduce((m, x) => Math.max(m, x.ply), 0);
+  if (w.net >= 150 && top) return [`${upTo(lastGot(top))}で${NAME[top]}を取る`, '筋'];
+  if (w.net >= 150) return [`${k.slice(0, lastGot() + 1).join('')}と進めて${gainNoun(w)}にする`, '筋'];
+  if (I.check) return [`${T.k}と王手をかける`, '手'];
+  return [`${T.k}から攻めを続ける`, '筋'];
 }
 function threatNoun(T) {
   const [v, n] = threatVerb(T);
-  return v.endsWith('両取りをかける') ? `${T.k}の両取り` : v.endsWith('から攻める') ? `${T.k}からの攻め` : v + n;
+  return v + n;
 }
 // ---------------------------------------------------------------- この手の主な理由
 function purposeOf(X) {
@@ -657,8 +666,10 @@ function purposeOf(X) {
   if (I.cap && I.see >= 150) return 'capture';
   if (X.mt && X.mt.real && X.mt.mate) return 'mateThreat';
   // 突いてきた歩などをそのまま取るのは「受け」とは言わない（取らないと何をされるかは、ほかの手の説明で）
-  if (X.rt && X.rt.real && X.rtHandled && !(X.rtHandled === 'took' && I.onPrev)) return 'defend';
-  if (I.fled >= 300) return 'escape';
+  // 攻めの手が結果として狙いを消している（駒をかわしている、相手に暇を与えない）なら、攻めの方を主に言う
+  const attackFirst = X.attacking && (X.rtHandled === 'moved' || X.rtHandled === 'other');
+  if (X.rt && X.rt.real && X.rtHandled && !(X.rtHandled === 'took' && I.onPrev) && !attackFirst) return 'defend';
+  if (I.fled >= 300 && !X.attacking) return 'escape';
   if (I.t === FU && I.threats.some(th => th.g >= 300 && I.hits.some(h => h.s === th.s))) return 'pawnStrike';
   if (I.see <= -150 && X.score > -MATE_IN_MAX) return 'sacrifice';
   if (X.pawnTrade) return 'pawnTrade';
@@ -666,6 +677,7 @@ function purposeOf(X) {
   if (I.cap && I.onPrev && !I.recapture) return 'accept';
   if (I.promo && X.L.promos.length && X.L.promos[0].ply === 0 && X.L.promos[0].kept) return 'promote';
   if (X.mt && X.mt.real) return 'threat';
+  if (!X.takenNow && I.t !== FU && I.threats.some(t => t.t !== FU && t.g >= 300 && I.hits.some(h => h.s === t.s))) return 'hit';
   if (I.castle) return 'castle';
   if (I.t === FU && I.hits.some(h => h.t !== OU)) return 'pawnStrike';
   if (I.check) return 'check';
@@ -809,16 +821,17 @@ const LEAD = {
       `${X.Mk}と取って、あなたの${d}を未然に防ぎました。`,
       `${d}を許さないよう、${X.Mk}と狙いの駒を取り払います。`,
     ]);
-    if (how === 'fled') return X.say('defend.fled', [
+    if (how === 'moved') return X.say('defend.moved', [
       `${d}を避けるため、${X.Mk}と${NAME[I.t]}を逃がしました。`,
       `${X.Mk}と${X.v[1]}、${d}をかわしています。`,
+      `狙われていた${NAME[I.t]}を${X.Mk}と${X.v[1]}、${d}をかわします。`,
     ]);
-    const te = how === 'guarded' && T.cap ? `${NAME[T.cap.board]}に紐をつけて` : how === 'blocked' ? '利きを止めて' : X.v[1];
+    const blk = how === 'blocked' && I.blocks.find(b => b.s === mFrom(T.T));
+    const te = how === 'guarded' && T.cap ? `${sqName(T.cap.s)}の${NAME[T.cap.board]}に紐をつけて` : blk ? `${NAME[blk.t]}の利きを止めて` : X.v[1];
     return X.say('defend', [
-      `あなたは次に${d}を狙っていました。${X.Mk}はそれを防ぐ手です。`,
+      `あなたは次に${d}を狙っていました。${X.Mk}と${te}、それを防ぎます。`,
       `${d}が気になる局面でした。${X.Mk}と${te}、その狙いを消しています。`,
-      `何もしないと${T.k}が厳しいので、${X.Mk}で先に手を打ちました。`,
-      `${X.Mk}は受けの手です。${d}を未然に防ぎました。`,
+      `何もしないと${d}が厳しいので、${X.Mk}と${te}先に受けておきます。`,
     ]);
   },
   accept(X) {
@@ -880,6 +893,13 @@ const LEAD = {
       `${X.Mk}と${X.v[1]}、次に${d}を見せました。`,
       `次に${d}があるので、あなたは受けに回る必要があります。${X.Mk}はその含みを持った手です。`,
       `${X.Mk}は${d}を狙った一手です。`,
+    ]);
+  },
+  hit(X) {
+    const I = X.Mi, t = I.threats.filter(x => x.t !== FU && I.hits.some(h => h.s === x.s)).sort((a, b) => b.g - a.g)[0];
+    return X.say('hit', [
+      `${X.Mk}と${X.v[1]}、${sqName(t.s)}の${NAME[t.t]}に当てました。`,
+      `${X.Mk}で${sqName(t.s)}の${NAME[t.t]}に当たりをかけます。`,
     ]);
   },
   castle(X) {
@@ -1170,13 +1190,14 @@ function whyNot(X, a, nth) {
   // 途中まで本命だった手
   if (X.mind && X.mind.m === a.c.m && !X.used.has('mind') && mindWorth(X, a)) {
     X.used.add('mind'); X.memo.mark('mind');
+    const since = sinceWhen(X), when = switchWhen(X);
     if (noun) return lead + X.say('why.was', [
-      `深さ${X.mind.d2}までは${A}を本命と見ていましたが、深く読むと${noun}が見つかったので、${M}に切り替えました。`,
+      `${since}${A}を本命と見ていましたが、${when}${noun}が見つかったので、${M}に切り替えました。`,
       `途中までは${A}が最善に見えていましたが、さらに読んで${noun}に気づき、取りやめました。`,
     ]);
     if (r.kind === 'close') return lead + X.say('why.was0', [
-      `深さ${X.mind.d2}までは${A}が最善でしたが、深く読むと${M}とほぼ並び、最後は${M}の方をわずかに上と見ました。`,
-      `${A}は途中まで本命でしたが、読み進めるうちに${M}が追いつき、最後に逆転しました。`,
+      `${since}${A}が最善でしたが、${when}${M}とほぼ並び、最後は${M}の方をわずかに上と見ました。`,
+      `${A}は途中まで本命でしたが、${when}${M}が追いつき、最後に逆転しました。`,
     ]);
   }
   const nm = (t) => NAME[t];
@@ -1324,6 +1345,16 @@ function avoids(X, a) {
   return '';
 }
 
+// 本命が入れ替わったのが読みのどのあたりか（深さの数字は出さず、時間の感覚で言う）
+function switchWhen(X) {
+  const D = X.main.depth || 0, ds = X.mind.ds;
+  if (D && ds > D) return '思考を終える直前に';
+  if (D && ds === D) return '思考を終える少し前に';
+  if (D && ds === D - 1) return '読みの後半で';
+  if (ds <= Math.max(5, D / 2)) return '読み始めてまもなく';
+  return '読み進めるうちに';
+}
+const sinceWhen = (X) => (X.mind.d1 <= 3 ? '最初は' : '途中までは');
 function mindWorth(X, a) { return X.mind.d2 >= 6 && (X.memo.ago('mind') >= 3 || X.mind.ds >= 12 || (a && a.dv >= 100)); }
 
 function pickAlts(X) {
@@ -1345,10 +1376,11 @@ function pickAlts(X) {
 function metaSentence(X, top) {
   if (X.mind && !X.used.has('mind') && X.mind.ds > 5 && mindWorth(X, X.alts.find(a => a.c.m === X.mind.m))) {
     X.used.add('mind'); X.memo.mark('mind');
+    const since = sinceWhen(X), when = switchWhen(X);
     return X.say('meta.mind', [
-      `深さ${X.mind.d2}までは${X.mind.k}を本命と見ていましたが、深さ${X.mind.ds}からは${X.Mk}が上回りました。`,
-      `読み始めは${X.mind.k}が最善に見えていました。深く読むにつれて順番が入れ替わり、最後は${X.Mk}を選んでいます。`,
-      `一度は${X.mind.k}に傾きましたが、深さ${X.mind.ds}で考えを改めました。`,
+      `${since}${X.mind.k}を本命と見ていましたが、${when}${X.Mk}が上回りました。`,
+      since === '最初は' ? `読み始めは${X.mind.k}が最善に見えていました。読み進めるうちに順番が入れ替わり、最後は${X.Mk}を選んでいます。` : null,
+      `一度は${X.mind.k}に傾きましたが、${when}考えを改めました。`,
     ]);
   }
   if (top && top.dv >= 300 && !isMate(top.c.s)) return X.say('meta.clear', [
@@ -1356,7 +1388,7 @@ function metaSentence(X, top) {
     `ほかの候補ではどれもうまくいかないので、迷う余地の少ない局面でした。`,
   ]);
   if (X.stable && X.stable <= 4 && top && top.dv >= 50) return X.say('meta.stable', [
-    `深さ${X.stable}の時点から最後まで、${X.Mk}が最善のまま変わりませんでした。`,
+    `読み始めから最後まで、${X.Mk}が最善のまま変わりませんでした。`,
     `読みの初めから終わりまで、本命は一貫して${X.Mk}でした。`,
   ]);
   const st = standNow(X);
@@ -1387,6 +1419,29 @@ function tempoSentence(X, book) {
   return X.say('tempo.chase', [`${NAME[T.R.t]}を引かせる分、こちらの手得になります。`, `相手の${NAME[T.R.t]}が下がる分だけ、手得を稼げます。`]);
 }
 
+// 主な理由とは別に、この手が相手の狙いをどうやって消しているか（「銀が４五から動いたので、〜もなくなりました」など）。
+// どう消しているのかをはっきり言えないときは何も言わない
+function alsoStops(X) {
+  const T = X.rt, I = X.Mi, how = X.rtHandled, d = threatNoun(T), nm = NAME[I.t];
+  if (how === 'moved') return X.say('also.moved', [
+    `${nm}が${sqName(I.from)}から動いたので、あなたの${d}もなくなりました。`,
+    `あなたの${d}も、${nm}を動かしたことでかわしています。`,
+  ]);
+  const blk = how === 'blocked' && I.blocks.find(b => b.s === mFrom(T.T));
+  if (blk) return X.say('also.blocked', [
+    `${X.Mk}で${NAME[blk.t]}の利きが止まったので、あなたの${d}もなくなりました。`,
+    `あなたの${d}も、${NAME[blk.t]}の利きを止めたことで防いでいます。`,
+  ]);
+  if (how === 'guarded' && T.cap) return X.say('also.guarded', [
+    `${sqName(T.cap.s)}の${NAME[T.cap.board]}に紐がついたので、あなたの${d}も怖くなくなりました。`,
+    `あなたの${d}も、${NAME[T.cap.board]}に紐をつけたことで防いでいます。`,
+  ]);
+  if (how === 'other' && X.attacking) return X.mt && X.mt.real
+    ? X.say('also.faster', [`あなたの${d}より、こちらの${X.used.has('mtTold') || ['threat', 'mateThreat', 'promote'].includes(X.purpose) ? '狙い' : threatNoun(X.mt)}の方が先です。`, `先にこちらが攻めるので、あなたに${d}を指す暇はありません。`])
+    : I.check ? `王手で先に攻めるので、あなたに${d}を指す暇はありません。` : '';
+  return '';
+}
+
 // ---------------------------------------------------------------- 組み立て
 function build(inp, memo) {
   memo = memo || MEMO;
@@ -1394,6 +1449,7 @@ function build(inp, memo) {
   const X = context(inp, memo);
   if (!X) return null;
   const purpose = purposeOf(X);
+  X.purpose = purpose;
   const lead = LEAD[purpose](X);
   X.leadText = lead;
   if (purpose === 'book') return { head: X.Mk, kind: purpose, paras: [polish(lead + tempoSentence(X, true))], rows: [], foot: '' };
@@ -1401,11 +1457,13 @@ function build(inp, memo) {
   const p1 = [lead];
   // 主な理由とは別に、この手の狙いや受けにも触れる
   if (!['threat', 'mateThreat', 'promote', 'fork'].includes(purpose) && X.mt && X.mt.real && !X.mt.mate && X.mt.gain >= 300 && !(purpose === 'pawnStrike' && mFrom(X.mt.T) === X.Mi.to))
-    p1.push(X.say('also.threat', [`さらに次は${threatNoun(X.mt)}も狙えます。`, `次に${threatNoun(X.mt)}が控えています。`]));
+    { p1.push(X.say('also.threat', [`さらに次は${threatNoun(X.mt)}も狙えます。`, `次に${threatNoun(X.mt)}が控えています。`])); X.used.add('mtTold'); }
   if (!['defend', 'defendMate'].includes(purpose) && X.rt && X.rt.real && X.rtHandled && X.rtHandled !== 'took' && !X.rt.mate && X.rt.gain >= 300)
-    p1.push(X.say('also.def', [`あなたの${threatNoun(X.rt)}も、この手で防いでいます。`, `同時に、${X.rt.k}の狙いも消えています。`]));
+    p1.push(alsoStops(X));
+  else if (X.attacking && X.Mi.fled >= 300 && purpose !== 'escape')   // 当たりの駒を、攻めながらかわす
+    p1.push(X.say('also.dodge', [`当たりのかかっていた${NAME[X.Mi.t]}を、攻めに使いながらかわしています。`, `取られそうだった${NAME[X.Mi.t]}をかわす意味もあります。`]));
   if (X.rt && X.rt.real && !X.rtHandled && !X.rt.mate && X.mt && X.mt.real && X.score >= -100 && !['defend', 'defendMate'].includes(purpose))
-    p1.push(X.say('race', [`あなたの${X.rt.k}も残っていますが、こちらの攻めの方が一手早いと見ています。`, `${X.rt.k}の狙いは承知の上で、先に攻める方を選びました。`]));
+    p1.push(X.say('race', [`あなたの${threatNoun(X.rt)}も残っていますが、こちらの攻めの方が一手早いと見ています。`, `あなたの${threatNoun(X.rt)}は承知の上で、先に攻める方を選びました。`]));
   if (X.tempo && X.tempo.kind !== 'chase') p1.push(tempoSentence(X));
   if (purpose !== 'forced' && purpose !== 'pawnTrade') p1.push(lineSentence(X));
   if (X.tempo && X.tempo.kind === 'chase') p1.push(tempoSentence(X));
@@ -1459,8 +1517,8 @@ function build(inp, memo) {
       ]);
     }
     if (g.alts[0].ref.kind === 'threatLeft') return conj + X.say('why.groupLeft', [
-      `${names}では${X.rt.k}を防げないので、選べませんでした。`,
-      `${names}は、どれも${X.rt.k}を受けていない手なので見送りました。`,
+      `${names}では、あなたの${threatNoun(X.rt)}を防げないので、選べませんでした。`,
+      `${names}は、どれもあなたの${threatNoun(X.rt)}を受けていない手なので見送りました。`,
     ]);
     if (g.alts[0].ref.kind === 'noTake') {
       const sq = sqName(X.Mi.to), c = NAME[X.Mi.cap], v = X.Mi.recapture ? '取り返せない' : '取れない';
@@ -1503,7 +1561,7 @@ function tableRows(X) {
 function footNote(X) {
   const d = X.d;
   if (!d || !d.depth) return '';
-  return `候補${d.cands.length}手を同じ深さ（${d.depth}手）まで読み比べた結果です。評価値は千里眼から見た値です。`;
+  return `候補${d.cands.length}手を、それぞれ${d.depth}手先まで読み比べた結果です。評価値は千里眼から見た値です。`;
 }
 
 const api = { build, Memo };
