@@ -2411,7 +2411,7 @@ function startExplain(main, res, msg, post) {
   ex.dfpn.clear();
   const t0 = now(), budget = Math.max(300, msg.explain.timeMs || 3000);
   const job = { ex, res, id: msg.id, post, t0, budget, end: t0 + budget, sliceEnd: 0, cancelled: false,
-    depth: 0, rootMoves: [], inCheck: ex.pos.inCheck(), cands: [{ m: res.move }], rootThreat: null, moveThreat: null, takes: [], aim: 0 };
+    depth: 0, rootMoves: [], inCheck: ex.pos.inCheck(), cands: [{ m: res.move }], rootThreat: null, moveThreat: null, takes: [], dare: null, aim: 0 };
   if (msg.explain.aim) job.aim = ex.pos.parseUSI(msg.explain.aim) || 0;
   job.gen = explainSteps(job);
   exJob = job;
@@ -2561,6 +2561,18 @@ function* explainSteps(job) {
       yield;
     }
   }
+  // 3c. what if the opponent goes ahead with the threat anyway (when the main line expects another reply)?
+  if (job.rootThreat && job.rootThreat.pv.length) {
+    const T0 = job.rootThreat.pv[0];
+    pos.doMove(M);
+    const T = legalRoot(pos).indexOf(T0) >= 0 ? T0 : 0;
+    pos.undoMove(M);
+    if (T && T !== res.pv[1]) {
+      const t = yield* exLine(job, [M, T], now() + job.budget * 0.06, Math.max(2, Math.min((res.depth || 8) - 2, 12)));
+      if (t) job.dare = { m: T, v: t.v, pv: t.pv, d: t.d };
+      yield;
+    }
+  }
   // 4. every candidate read to the same depth (exact score and line), deeper while time allows,
   //    keeping the last part of the budget for step 5
   const maxD = Math.max(2, Math.min(res.depth || 64, MAX_SPLY - 12)), deepEnd = job.t0 + job.budget * 0.72;
@@ -2598,6 +2610,7 @@ function exPublish(job, partial) {
     cands: job.cands.map(c => ({ m: u(c.m), s: c.done ? c.done.v : null, pv: c.done ? c.done.pv.map(u) : [], sh: c.sh, ef: c.ef,
       om: c.om ? c.om.map(u) : null, tr: thr(c.tr) })),
     rootThreat: thr(job.rootThreat), moveThreat: thr(job.moveThreat),
+    dare: job.dare ? { m: u(job.dare.m), v: job.dare.v, pv: job.dare.pv.map(u), d: job.dare.d } : null,
     takes: job.takes.map(t => ({ m: u(t.m), v: t.v, pv: t.pv.map(u), d: t.d })), nodes: job.ex.nodes, time: Math.round(now() - job.t0) } });
 }
 
@@ -2631,7 +2644,7 @@ function handleGo(searcher, msg, post) {
   // only now, with the move already sent, work out why it was chosen
   if (msg.explain && res.move && !res.book && !msg.weak) startExplain(searcher, res, msg, post);
 }
-Object.assign(api, { handleGo, cancelExplain, evalParts, seeMove, attacksFrom, OverlayTT });
+Object.assign(api, { handleGo, cancelExplain, startExplain, evalParts, seeMove, attacksFrom, OverlayTT });
 
 if (typeof importScripts === 'function' && typeof document === 'undefined' && typeof self !== 'undefined') {
   let searcher = null;

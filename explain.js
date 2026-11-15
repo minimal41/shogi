@@ -562,6 +562,8 @@ function context(inp, memo) {
     const A = after(P, [M], 1).parseUSI(t.m);
     if (A) X.takes.push({ A, v: t.v, L: walk(P, [main.move, t.m].concat(t.pv), side, X.lastTo) });
   }
+  // 相手が狙いをそのまま実行してきた場合の読み
+  if (d && d.dare && after(P, [M], 1).parseUSI(d.dare.m)) X.dare = { v: d.dare.v, L: walk(P, [main.move, d.dare.m].concat(d.dare.pv), side, X.lastTo) };
   // 候補手
   X.alts = [];
   X.twin = (a) => mFrom(a.A) === mFrom(M) && mTo(a.A) === mTo(M) && (mPiece(a.A) & 15) === (mPiece(M) & 15);   // 同じ手の成・不成違い
@@ -846,6 +848,13 @@ const LEAD = {
       `${d}を避けるため、${X.Mk}と${NAME[I.t]}を逃がしました。`,
       `${X.Mk}と${X.v[1]}、${d}をかわしています。`,
       `狙われていた${NAME[I.t]}を${X.Mk}と${X.v[1]}、${d}をかわします。`,
+    ]);
+    // 狙いを直接は消していない手：狙いの手を指されたときの返し技で説明する
+    const dr = how === 'other' ? dareReply(X) : null;
+    if (dr) return X.say('defend.dare', [
+      `あなたは次に${d}を狙っていました。${X.Mk}と${X.v[1]}おけば、${dr.k}${dr.te}、${dr.why}${dr.res}。${dr.better ? `かえってこちらが指しやすくなるので、${dr.k}とは指せなくなっています。` : `これで${dr.k}は怖くありません。`}`,
+      `${d}が気になる局面でした。${X.Mk}と${X.v[1]}おくと、${dr.k}には${dr.why}${dr.res}。${dr.better ? 'こちらが良くなるので、' : 'だから、'}その狙いは成立しなくなっています。`,
+      `何もしないと${d}が厳しいところです。${X.Mk}なら、${dr.k}${dr.te}、${dr.why}${dr.res}。${dr.better ? 'その形はこちらが指しやすいので、' : ''}これが受けになっています。`,
     ]);
     const blk = how === 'blocked' && I.blocks.find(b => b.s === mFrom(T.T));
     const te = how === 'guarded' && T.cap ? `${sqName(T.cap.s)}の${NAME[T.cap.board]}に紐をつけて` : blk ? `${NAME[blk.t]}の利きを止めて` : X.v[1];
@@ -1461,6 +1470,11 @@ function alsoStops(X) {
     `${sqName(T.cap.s)}の${NAME[T.cap.board]}に紐がついたので、あなたの${d}も怖くなくなりました。`,
     `あなたの${d}も、${NAME[T.cap.board]}に紐をつけたことで防いでいます。`,
   ]);
+  const dr = how === 'other' ? dareReply(X) : null;
+  if (dr) return X.say('also.dare', [
+    `あなたの${d}には、${dr.why}${dr.res}。`,
+    `あなたの${d}に対しては、${dr.why}${dr.res}。`,
+  ]);
   if (how === 'other' && X.attacking) return X.mt && X.mt.real
     ? X.say('also.faster', [`あなたの${d}より、こちらの${X.used.has('mtTold') || ['threat', 'mateThreat', 'promote'].includes(X.purpose) ? '狙い' : threatNoun(X.mt)}の方が先です。`, `先にこちらが攻めるので、あなたに${d}を指す暇はありません。`])
     : I.check ? `王手で先に攻めるので、あなたに${d}を指す暇はありません。` : '';
@@ -1508,6 +1522,30 @@ function ifTaken(X) {
     return { k: k[1], why, res, F: E.moveToUSI(F) };
   }
   return null;
+}
+// 相手の狙いを直接は消していない受け：狙いの手を指されても、こう返せるから成立しない、という説明。
+// 狙いの手で相手の駒が動いたせいで成立する返し技なら、そのことも言う
+function dareReply(X) {
+  const D = X.dare;
+  if (!D || D.L.moves.length < 3 || D.v < X.score - 50) return null;
+  const L = D.L, k = L.kifs, T = L.moves[1], F = L.moves[2];
+  const cap = L.got.find(x => x.ply === 2), pr = L.promos.find(p => p.mine && p.kept && p.ply === 2);
+  const w = matWords(L, Math.min(L.horizon, 6), 1), lost = L.lost.find(x => x.ply === 1);
+  let res = '';
+  if (L.mated === (X.side ^ 1) && L.moves.length <= 8) res = `${k.slice(2).join('')}で詰みます`;
+  else if (cap && pr) res = `${k[2]}で${NAME[cap.board]}を取りながら${NAME[pr.t]}を作れます`;
+  else if (pr) res = `${k[2]}と${NAME[pr.t]}を作れます`;
+  else if (cap && w.net >= -60) res = lost ? `${k[2]}で${NAME[cap.board]}を取り返せます` : `${k[2]}で${NAME[cap.board]}を取れます`;
+  else if (w.net >= 150 && gainNoun(w)) res = `${k.slice(2, Math.min(L.horizon, 6) + 1).join('')}と進んで、${gainNoun(w)}になります`;
+  else return null;
+  const pM = after(X.P, [X.M], 1), from = mFrom(T);
+  let why = '';
+  if (from && mTo(F) !== mTo(T)) {
+    pM.doNull();
+    if (!pM.parseUSI(E.moveToUSI(F))) why = `${NAME[mPiece(T) & 15]}が${sqName(from)}を離れるので、`;
+  }
+  // 狙いを実行するとかえって相手が損をするか（読み筋の形勢より、こちらがはっきり良くなる）
+  return { k: k[1], te: lost ? `と${NAME[lost.board]}を取られても` : 'と指されても', why, res, better: D.v - X.score >= 150 };
 }
 function takenSentence(X, tk) {
   return X.say('taken', [`${tk.k}と取ると、${tk.why}${tk.res}。`, `${tk.k}なら、${tk.why}${tk.res}。`, `${tk.k}と取ってくれば、${tk.why}${tk.res}。`]);
