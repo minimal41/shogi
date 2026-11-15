@@ -1165,17 +1165,17 @@ const IS_DEF = new Uint8Array([0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 0, 0]);
 const ZONE5A = (() => { const z = []; for (let dr = -2; dr <= 2; dr++) for (let dc = -2; dc <= 2; dc++) if (Math.max(Math.abs(dr), Math.abs(dc)) === 2) z.push(dr * 11 + dc); return Int32Array.from(z); })();
 const KST = new Float64Array(2 * 10);
 // Attack / defence counts around a king, pooled left-right: front, front-diagonals, sides, back-diagonals, back
+const KG_OFF = [Int32Array.from([-11, -12, -10, -1, 1, 10, 12, 11]), Int32Array.from([11, 10, 12, -1, 1, -12, -10, -11])];
+const KG_GRP = Int32Array.from([0, 1, 1, 2, 2, 3, 3, 4]);
+const KG_BUF = new Float64Array(20);
 function kingGroups(pos, c, out, o) {
-  const k = pos.kingSq[c], b = pos.board, atkT = pos.atk[c ^ 1], atkO = pos.atk[c];
-  const f = c === BLACK ? -11 : 11;
-  const sq = [k + f, k + f - 1, k + f + 1, k - 1, k + 1, k - f - 1, k - f + 1, k - f];
-  const grp = [0, 1, 1, 2, 2, 3, 3, 4];
+  const k = pos.kingSq[c], b = pos.board, atkT = pos.atk[c ^ 1], atkO = pos.atk[c], off = KG_OFF[c];
   for (let i = 0; i < 10; i++) out[o + i] = 0;
   for (let i = 0; i < 8; i++) {
-    const s2 = sq[i];
+    const s2 = k + off[i];
     if (b[s2] === WALL) continue;
-    out[o + grp[i]] += atkT[s2];
-    out[o + 5 + grp[i]] += atkO[s2];
+    out[o + KG_GRP[i]] += atkT[s2];
+    out[o + 5 + KG_GRP[i]] += atkO[s2];
   }
 }
 const DENSE_MAT = new Float64Array(1);
@@ -1196,8 +1196,12 @@ function denseFeatures(pos, out) {
     for (let t = 1; t <= 7; t++) { out[base + 19 + t] = h[us * 8 + t]; out[base + 26 + t] = h[op * 8 + t]; }
     out[base + 34] = (v === 0 ? matB : -matB) / 1000;
     out[base + 35] = pos.stm === us ? 1 : 0;
-    kingGroups(pos, us, out, base + 36);
-    kingGroups(pos, op, out, base + 46);
+  }
+  // the same two king neighbourhoods serve both views
+  kingGroups(pos, 0, KG_BUF, 0); kingGroups(pos, 1, KG_BUF, 10);
+  for (let i = 0; i < 10; i++) {
+    const g0 = KG_BUF[i], g1 = KG_BUF[10 + i];
+    out[36 + i] = g0; out[46 + i] = g1; out[ND + 36 + i] = g1; out[ND + 46 + i] = g0;
   }
   return 2 * ND;
 }
@@ -1642,6 +1646,10 @@ class DfPn {
 // Searcher
 // ---------------------------------------------------------------------------
 const ATK_ORDER = new Int32Array([0, 1, 2, 3, 4, 7, 8, 5, 15, 6, 6, 6, 6, 9, 10, 0]);
+// Continuation history: [piece and square of an earlier move][piece and square of this move]
+const IDX81 = new Uint8Array(NSQ);
+for (let i = 0; i < 81; i++) IDX81[SQ81[i]] = i;
+const CH_N = 32 * 81;
 
 class Searcher {
   constructor(ttBits) {
@@ -1651,6 +1659,8 @@ class Searcher {
     this.hist = new Int32Array(64 * NSQ);
     this.killers = new Int32Array(MAX_SPLY * 2 + 8);
     this.counter = new Int32Array(32 * NSQ);
+    this.cont = new Int16Array(CH_N * CH_N);
+    this.contBase = new Int32Array(MAX_SPLY + 4).fill(-1);   // row of the move made at each ply (-1: none / null move)
     this.moveBuf = []; this.scoreBuf = []; this.quietBuf = []; this.badBuf = [];
     for (let i = 0; i < MAX_SPLY + 4; i++) {
       this.moveBuf.push(new Int32Array(700)); this.scoreBuf.push(new Int32Array(700));
@@ -1663,7 +1673,7 @@ class Searcher {
     this.curMove = new Int32Array(MAX_SPLY + 4);
     this.seeGain = new Int32Array(64); this.seeSq = new Int32Array(64); this.seePc = new Int32Array(64);
     this.mateBuf = new Int32Array(700);
-    this.ecLo = new Int32Array(1 << 16); this.ecHi = new Int32Array(1 << 16); this.ecVal = new Int16Array(1 << 16);
+    this.ecLo = new Int32Array(1 << 18); this.ecHi = new Int32Array(1 << 18); this.ecVal = new Int16Array(1 << 18);
     this.nodes = 0; this.stopped = false; this.deadline = Infinity; this.nodeLimit = Infinity;
     this.rootEffort = new Map();   // nodes spent on each root move (for explanations)
     this.contempt = 40; this.rootSide = 0; this.repLimit = 32;
@@ -1673,6 +1683,7 @@ class Searcher {
     this.lmpImpBase = 4; this.lmpImpMul = 2; this.lmpBase = 2; this.lmpMul = 1;
     this.futBase = 120; this.futMul = 110;
     this.rfpMul = 100;
+    this.lmrHistDiv = 6000;
     this.lmr = new Int8Array(64 * 64);
     this.setLmrDiv(2.2);
   }
@@ -1683,7 +1694,7 @@ class Searcher {
   }
 
   evaluate() {
-    const pos = this.pos, i = pos.hashLo & 0xffff;
+    const pos = this.pos, i = pos.hashLo & 0x3ffff;
     if (this.ecLo[i] === pos.hashLo && this.ecHi[i] === pos.hashHi) return this.ecVal[i];
     let v = evaluate(pos);
     if (v > 20000) v = 20000; else if (v < -20000) v = -20000;
@@ -1909,7 +1920,7 @@ class Searcher {
       if (depth >= 2 && ev >= beta && staticEval >= beta - 30 * depth + 150 && this.curMove[ply - 1] !== 0 && beta > -MATE_IN_MAX) {
         const R = 3 + (depth >> 2) + Math.min(3, ((ev - beta) / 200) | 0);
         pos.doNull();
-        this.curMove[ply] = 0;
+        this.curMove[ply] = 0; this.contBase[ply] = -1;
         let v = -this.search(-beta, -beta + 1, depth - R, ply + 1, !cutNode);
         pos.undoNull();
         if (this.stopped) return 0;
@@ -1935,7 +1946,8 @@ class Searcher {
     const k0 = this.killers[ply * 2], k1 = this.killers[ply * 2 + 1];
     const prev = ply > 0 ? this.curMove[ply - 1] : 0;
     const cm = prev ? this.counter[((prev >> 17) & 31) * NSQ + ((prev >> 8) & 255)] : 0;
-    const hist = this.hist;
+    const hist = this.hist, cont = this.cont;
+    const cb1 = ply >= 1 ? this.contBase[ply - 1] : -1, cb2 = ply >= 2 ? this.contBase[ply - 2] : -1;
     const quiets = this.quietBuf[ply];
     let nq = 0, legal = 0, bestScore = -INF, bestMove = 0;
     const origAlpha = alpha;
@@ -1983,7 +1995,12 @@ class Searcher {
           n = pos.gen(moves, n, 6);
           for (let j = q0; j < n; j++) {
             const mv = moves[j];
-            scores[j] = (mv & PROMO) ? (1 << 27) + PV[((mv >> 17) & 15) + 8] : hist[this.histIndex(mv)];
+            if (mv & PROMO) { scores[j] = (1 << 27) + PV[((mv >> 17) & 15) + 8]; continue; }
+            let sc = hist[this.histIndex(mv)];
+            const ci = ((mv >> 17) & 31) * 81 + IDX81[(mv >> 8) & 255];
+            if (cb1 >= 0) sc += cont[cb1 + ci];
+            if (cb2 >= 0) sc += cont[cb2 + ci];
+            scores[j] = sc;
           }
           idx = q0; stage = 5;
         }
@@ -2005,7 +2022,12 @@ class Searcher {
           n = pos.genEvasions(moves, 0, false);
           for (let j = 0; j < n; j++) {
             const mv = moves[j], cp = (mv >> 22) & 31;
-            scores[j] = cp ? (1 << 28) + EXV[cp & 15] * 32 - ATK_ORDER[(mv >> 17) & 15] : hist[this.histIndex(mv)];
+            if (cp) { scores[j] = (1 << 28) + EXV[cp & 15] * 32 - ATK_ORDER[(mv >> 17) & 15]; continue; }
+            let sc = hist[this.histIndex(mv)];
+            const ci = ((mv >> 17) & 31) * 81 + IDX81[(mv >> 8) & 255];
+            if (cb1 >= 0) sc += cont[cb1 + ci];
+            if (cb2 >= 0) sc += cont[cb2 + ci];
+            scores[j] = sc;
           }
           idx = 0; stage = 11;
         }
@@ -2023,6 +2045,13 @@ class Searcher {
       const cap = (m >> 22) & 31;
       const quiet = !cap && !(m & PROMO);
       const gives = pos.givesCheck(m);
+      let hv = 0;
+      if (quiet) {
+        hv = hist[this.histIndex(m)];
+        const ci = ((m >> 17) & 31) * 81 + IDX81[(m >> 8) & 255];
+        if (cb1 >= 0) hv += cont[cb1 + ci];
+        if (cb2 >= 0) hv += cont[cb2 + ci];
+      }
       if (!rootNode && bestScore > -MATE_IN_MAX && legal > 0 && !inCheck) {
         if (quiet && !gives) {
           if (depth <= 8 && legal >= lmpLimit) continue;
@@ -2038,6 +2067,7 @@ class Searcher {
       }
       legal++;
       this.curMove[ply] = m;
+      this.contBase[ply] = (((m >> 17) & 31) * 81 + IDX81[(m >> 8) & 255]) * CH_N;
       const n0 = this.nodes;
       let ext = 0;
       if (gives && ply < 2 * this.rootDepth && (depth <= 3 || this.seeAfterOk(m))) ext = 1;
@@ -2053,7 +2083,7 @@ class Searcher {
           if (cutNode) r++;
           if (!improving) r++;
           if (m === k0 || m === k1 || m === cm) r--;
-          if (quiet) r -= (hist[this.histIndex(m)] / 6000) | 0;
+          if (quiet) r -= (hv / this.lmrHistDiv) | 0;
           if (gives) r--;
           if (inCheck) r--;
           if (r < 0) r = 0;
@@ -2117,6 +2147,18 @@ class Searcher {
     for (let i = 0; i < nq; i++) {
       idx = this.histIndex(quiets[i]);
       h[idx] -= bonus + ((h[idx] * bonus) / 16384 | 0);
+    }
+    const c = this.cont;
+    for (let k = 1; k <= 2; k++) {
+      const cb = ply >= k ? this.contBase[ply - k] : -1;
+      if (cb < 0) continue;
+      idx = cb + ((m >> 17) & 31) * 81 + IDX81[(m >> 8) & 255];
+      c[idx] += bonus - ((c[idx] * bonus) / 16384 | 0);
+      for (let i = 0; i < nq; i++) {
+        const q = quiets[i];
+        idx = cb + ((q >> 17) & 31) * 81 + IDX81[(q >> 8) & 255];
+        c[idx] -= bonus + ((c[idx] * bonus) / 16384 | 0);
+      }
     }
   }
 
@@ -2325,7 +2367,7 @@ Object.assign(api, { denseFeatures, setNN, ND, NH, evaluate, evaluateHand, extra
 // state — so the move, its strength and its thinking time are exactly what they would be without it.
 // ---------------------------------------------------------------------------
 const EX_SLICE_MS = 120, EX_CANDS = 5;
-const EX_COPY = ['contempt', 'repLimit', 'useMate1', 'mate1Depth', 'qsChecks', 'lmpImpBase', 'lmpImpMul', 'lmpBase', 'lmpMul', 'futBase', 'futMul', 'rfpMul'];
+const EX_COPY = ['contempt', 'repLimit', 'useMate1', 'mate1Depth', 'qsChecks', 'lmpImpBase', 'lmpImpMul', 'lmpBase', 'lmpMul', 'futBase', 'futMul', 'rfpMul', 'lmrHistDiv'];
 const SEE_CTX = { pos: null, seeGain: new Int32Array(64), seeSq: new Int32Array(64), seePc: new Int32Array(64), leastAttacker: Searcher.prototype.leastAttacker };
 function seeMove(pos, m) { SEE_CTX.pos = pos; return Searcher.prototype.see.call(SEE_CTX, m); }
 
@@ -2363,13 +2405,14 @@ function startExplain(main, res, msg, post) {
   ex.tt.base = main.tt; ex.tt.age = (ex.tt.age + 1) & 63;
   for (const k of EX_COPY) ex[k] = main[k];
   if (ex.lmrDiv !== main.lmrDiv) ex.setLmrDiv(main.lmrDiv);
-  ex.hist.set(main.hist); ex.counter.set(main.counter); ex.killers.set(main.killers);
+  ex.hist.set(main.hist); ex.counter.set(main.counter); ex.killers.set(main.killers); ex.cont.set(main.cont);
   ex.pos.copyFrom(main.pos);
   ex.rootSide = ex.pos.stm; ex.nodes = 0; ex.nodeLimit = Infinity;
   ex.dfpn.clear();
   const t0 = now(), budget = Math.max(300, msg.explain.timeMs || 3000);
   const job = { ex, res, id: msg.id, post, t0, budget, end: t0 + budget, sliceEnd: 0, cancelled: false,
-    depth: 0, rootMoves: [], inCheck: ex.pos.inCheck(), cands: [{ m: res.move }], rootThreat: null, moveThreat: null };
+    depth: 0, rootMoves: [], inCheck: ex.pos.inCheck(), cands: [{ m: res.move }], rootThreat: null, moveThreat: null, takes: [], aim: 0 };
+  if (msg.explain.aim) job.aim = ex.pos.parseUSI(msg.explain.aim) || 0;
   job.gen = explainSteps(job);
   exJob = job;
   setTimeout(() => exSlice(job), 0);
@@ -2448,6 +2491,24 @@ function* exThreat(job, moves, phaseEnd) {
   return best && { pv: best.pv, v: best.v, st, mate };
 }
 
+// Reads on after `moves` from the root (deeper while the phase's time allows): the score for the
+// side to move there and its best line
+function* exLine(job, moves, phaseEnd, maxD) {
+  const ex = job.ex, pos = ex.pos;
+  for (const m of moves) { pos.doMove(m); pos.histCheck[pos.ply] = pos.inCheck() ? 1 : 0; }
+  ex.curMove[0] = moves[moves.length - 1]; ex.contBase[0] = -1;
+  let best = null;
+  for (let d = 1; d <= maxD; d++) {
+    ex.rootDepth = d;
+    const v = yield* exRun(job, phaseEnd, () => ex.search(-INF, INF, d, 1, false));
+    if (v === null) break;
+    best = { v, pv: pvAt(ex, 1), d };
+    if (Math.abs(v) >= MATE_IN_MAX) break;
+  }
+  for (let i = moves.length - 1; i >= 0; i--) pos.undoMove(moves[i]);
+  return best;
+}
+
 function* explainSteps(job) {
   const ex = job.ex, pos = ex.pos, res = job.res, M = res.move, iters = res.iters || [];
   const roots = job.rootMoves = legalRoot(pos);
@@ -2471,6 +2532,8 @@ function* explainSteps(job) {
   let total = 0;
   for (const v of eff.values()) total += v;
   const pick = [M];
+  // the follow-up the previous move was aiming at is always compared (was it still possible?)
+  if (job.aim && job.aim !== M && roots.indexOf(job.aim) >= 0) pick.push(job.aim);
   const add = (m) => { if (m && pick.length < EX_CANDS && pick.indexOf(m) < 0 && roots.indexOf(m) >= 0) pick.push(m); };
   const byEffort = roots.filter(m => m !== M).sort((a, b) => (eff.get(b) || 0) - (eff.get(a) || 0) || (sh.get(b) || 0) - (sh.get(a) || 0));
   add(byEffort[0]); add(byEffort[1]);
@@ -2486,6 +2549,18 @@ function* explainSteps(job) {
   // 3. the opponent's threat against us, and what our move threatens
   job.rootThreat = yield* exThreat(job, [], now() + job.budget * 0.06);
   job.moveThreat = yield* exThreat(job, [M], now() + job.budget * 0.06);
+  // 3b. what if the opponent simply takes the piece that just moved (when the main line expects another reply)?
+  {
+    pos.doMove(M);
+    const reps = legalRoot(pos).filter(m => mTo(m) === mTo(M) && mCap(m) && m !== res.pv[1])
+      .sort((a, b) => SEE_V[mPiece(a) & 15] - SEE_V[mPiece(b) & 15]).slice(0, 2);
+    pos.undoMove(M);
+    for (const r of reps) {
+      const t = yield* exLine(job, [M, r], now() + job.budget * 0.05, Math.max(2, Math.min((res.depth || 8) - 2, 12)));
+      if (t) job.takes.push({ m: r, v: t.v, pv: t.pv, d: t.d });
+      yield;
+    }
+  }
   // 4. every candidate read to the same depth (exact score and line), deeper while time allows,
   //    keeping the last part of the budget for step 5
   const maxD = Math.max(2, Math.min(res.depth || 64, MAX_SPLY - 12)), deepEnd = job.t0 + job.budget * 0.72;
@@ -2522,7 +2597,8 @@ function exPublish(job, partial) {
     iters: (res.iters || []).map(it => [it.depth, u(it.move), it.score]),
     cands: job.cands.map(c => ({ m: u(c.m), s: c.done ? c.done.v : null, pv: c.done ? c.done.pv.map(u) : [], sh: c.sh, ef: c.ef,
       om: c.om ? c.om.map(u) : null, tr: thr(c.tr) })),
-    rootThreat: thr(job.rootThreat), moveThreat: thr(job.moveThreat), nodes: job.ex.nodes, time: Math.round(now() - job.t0) } });
+    rootThreat: thr(job.rootThreat), moveThreat: thr(job.moveThreat),
+    takes: job.takes.map(t => ({ m: u(t.m), v: t.v, pv: t.pv.map(u), d: t.d })), nodes: job.ex.nodes, time: Math.round(now() - job.t0) } });
 }
 
 // ---------------------------------------------------------------------------

@@ -168,7 +168,11 @@ function requestAI() {
   render();
   const L = LEVELS[G.level];
   const req = Object.assign({}, L.req);
-  if (G.explain && L.explainMs && EXP) req.explain = { timeMs: L.explainMs };
+  if (G.explain && L.explainMs && EXP) {
+    req.explain = { timeMs: L.explainMs };
+    const last = G.notes[G.moves.length - 2];   // 前の手で狙っていた手（まだ成立するかを読み比べに加える）
+    if (last && last.aim) req.explain.aim = last.aim;
+  }
   startThinkBar(req.timeMs ? (mode === 'local' ? Math.min(req.timeMs, 2500) : req.timeMs) : 0);
   ask('ai', req);
 }
@@ -206,7 +210,7 @@ function onAIMove(d, msg) {
   G.moves.push(d.move);
   applyInternal(m);
   justTo = mTo(m);
-  if (msg && msg.explain) startWhy(d, ply, base, lastTo, prev, msg.explain.timeMs);
+  if (msg && msg.explain) startWhy(d, ply, base, lastTo, prev, msg.explain.timeMs, msg.explain.aim || '');
   clack();
   afterMove();
 }
@@ -218,12 +222,12 @@ function capChain(ply) {
   for (let i = ply - 1; i >= 0 && H.caps[i] && out.length < 8; i--) out.push(H.caps[i]);
   return out;
 }
-function startWhy(d, ply, base, lastTo, prev, ms) {
+function startWhy(d, ply, base, lastTo, prev, ms, aim) {
   const main = { move: d.move, score: d.score, depth: d.depth, pv: d.pv, book: d.book, dfpn: d.dfpn, mate: d.mate };
   why = null;
   const hist = G.moves.slice(0, ply);   // the moves before this one (for tempo: who started an exchange)
   if (d.book) { storeWhy({ ply, base, lastTo, prev, main, hist }, null); return; }   // no reading to compare for a book move
-  why = { id: d.id, ply, base, lastTo, prev, main, hist, started: Date.now(), ms };
+  why = { id: d.id, ply, base, lastTo, prev, main, hist, started: Date.now(), ms, aim };
 }
 function onExplain(d) {
   if (!why || d.id !== why.id) return;
@@ -235,8 +239,8 @@ function onExplain(d) {
 function storeWhy(w, data) {
   if (G.moves[w.ply] !== w.main.move) return;   // taken back in the meantime
   let note = null;
-  try { note = EXP.build({ base: w.base, lastTo: w.lastTo, prev: w.prev, ply: w.ply, hist: w.hist, data, main: w.main }, whyMemo); } catch (e) { note = null; }
-  G.notes[w.ply] = note ? { head: note.head, paras: note.paras, rows: note.rows, foot: note.foot }
+  try { note = EXP.build({ base: w.base, lastTo: w.lastTo, prev: w.prev, ply: w.ply, hist: w.hist, data, main: w.main, aim: w.aim }, whyMemo); } catch (e) { note = null; }
+  G.notes[w.ply] = note ? { head: note.head, paras: note.paras, rows: note.rows, foot: note.foot, aim: note.aim || '' }
     : { head: '', paras: ['この手の理由はうまく言葉にできませんでした。'], rows: [], foot: '' };
   save();
 }

@@ -510,6 +510,7 @@ function context(inp, memo) {
   for (let c = 0; c < 2; c++) for (let t = KY; t <= KI; t++) X.handPieces += P.hand[c * 8 + t];
   if (SQ81.filter(q => P.board[q]).length < 30) X.handPieces = 9;
   X.opening = isOpening(P, inp.ply || 0, [X.lastTo, X.Mi.to]);
+  X.takes = []; X.alts = []; X.aimPrev = '';
   if (main.book) { X.tempo = tempoNote(X, inp.hist); return X; }
   // 直前まで続いていた駒の取り合いも含めて損得を数える（取り返しただけで「駒得」と言わない）。
   // chain は直前の手から順に、続けて取られた（取った）駒
@@ -545,6 +546,22 @@ function context(inp, memo) {
   X.attacking = X.Mi.check || (X.Mi.promo && !X.takenNow) || !!(X.mt && X.mt.real) || X.Mi.threats.some(t => t.g >= 300 && X.Mi.hits.some(h => h.s === t.s));
   if (X.rt && X.rt.real) X.rtHandled = handled(X);
   X.tempo = tempoNote(X, inp.hist);
+  // 直前の相手の手そのもの（こちらの角や飛車の利きを止めた、など）
+  X.aimPrev = inp.aim || '';
+  if (inp.hist && inp.hist.length) {
+    const p0 = new E.Position();
+    p0.setSFEN(inp.start || E.START_SFEN);
+    let ok = true;
+    for (let i = 0; i < inp.hist.length - 1 && ok; i++) { const m = p0.parseUSI(inp.hist[i]); if (m) p0.doMove(m); else ok = false; }
+    const pm = ok ? p0.parseUSI(inp.hist[inp.hist.length - 1]) : 0;
+    if (pm) { X.prevP = p0; X.prevI = moveInfo(p0, pm, 0); }
+  }
+  // 動かした駒を相手が取ってきた場合の読み（読み筋の応手がそれ以外のとき）
+  X.takes = [];
+  for (const t of (d && d.takes) || []) {
+    const A = after(P, [M], 1).parseUSI(t.m);
+    if (A) X.takes.push({ A, v: t.v, L: walk(P, [main.move, t.m].concat(t.pv), side, X.lastTo) });
+  }
   // 候補手
   X.alts = [];
   X.twin = (a) => mFrom(a.A) === mFrom(M) && mTo(a.A) === mTo(M) && (mPiece(a.A) & 15) === (mPiece(M) & 15);   // 同じ手の成・不成違い
@@ -621,11 +638,15 @@ function replyTe(R, prev) {
   if (R.cap && R.to === mTo(prev)) return mCap(prev) ? 'と取り返して' : 'と取って';
   if (R.cap) return `と${NAME[R.cap]}を取って`;
   if (R.check) return 'と王手をかけて';
+  const blk = blockOf(R);
+  if (blk) return blk.t === KA || blk.t === UM ? `と${NAME[blk.t]}道を止めて` : `と${NAME[blk.t]}の利きを止めて`;
   if (R.fled) return 'と逃げて';
   if (R.saved.length) return 'と受けて';
   if (R.threats.length) return 'と反撃して';
   return 'と応じて';
 }
+// その手で利きを止められた相手の大駒（香車より角・飛車を優先）
+const blockOf = (I) => (I && I.blocks.length ? I.blocks.find(b => b.t !== KY) || I.blocks[0] : null);
 // 取られる駒の名前。読み筋の途中で成った駒は、いま盤上にある姿（成る前の名前）で呼ぶ
 const capName = (L, x) => (x.board !== x.t && L.promos.some(p => !p.mine && p.s === x.s && p.ply < x.ply) ? NAME[x.t] : NAME[x.board]);
 // 狙いの中身を動詞句で（「△５五角で４四の金を取る」「▲１四歩△同歩のあと、▲同香で香車を取る」など）と、
@@ -1001,6 +1022,10 @@ function lineSentence(X) {
   const out = outcome(X), te = replyTe(X.R, X.M);
   const best = rest && !/最善/.test(X.leadText || '');   // 「最善」を一つの段落で二度言わない
   // 相手の応手はもう書いたので、その先だけ
+  if (blockOf(X.R) && !X.R.cap && rest && !X.used.has('reply')) return X.say('line.block', [
+    `${k[1]}${te}くるのが最善と見ていて、以下${rest}と続きます。${out}`,
+    `あなたの最善の応手は${k[1]}${te}受ける手で、以下${rest}と進むと読んでいます。${out}`,
+  ]);
   if (X.used.has('reply') && rest) return X.say('line.rest', [`以下${rest}と進むと読んでいます。`, `そのあとは${rest}と続く見込みです。`]) + out;
   if (!out) return X.say('line.plain', [
     `読み筋は${seq}です。`,
@@ -1147,7 +1172,7 @@ function problemNoun(X, r) {
     case 'mate': return `${r.K}からの詰み筋`;
     case 'threatLeft': return `${X.rt.k}を防げない弱点`;
     case 'fork': return r.check ? `${pre}${r.K}の王手${NAME[r.big[0].t]}取り` : `${pre}${r.K}の両取り`;
-    case 'noTake': return `${sqName(X.Mi.to)}の${NAME[X.Mi.cap]}を${X.Mi.recapture ? '取り返せない' : '取れない'}`;
+    case 'noTake': return `${sqName(X.Mi.to)}の${NAME[X.Mi.cap]}を${X.Mi.recapture ? '取り返せない' : '取れない'}問題`;
     case 'loose': return `${r.key === 1 ? r.K : r.seq}でただ取られてしまう筋`;
     case 'exposed': return `${r.seq}で${NAME[r.piece.t]}を取られる筋`;
     case 'badTrade': return `${r.K}と取り返されて損をする筋`;
@@ -1398,7 +1423,7 @@ function metaSentence(X, top) {
 
 // 「▲６二とと取る」「△同銀とと金を取る」のような、と が重なる言い方を直す
 function polish(t) {
-  return t.replace(/([▲△][^、。▲△（）]*?と)と(?=[取指寄上引逃打成突跳出回応受反攻迫追])/g, '$1で').replace(/([▲△][^、。▲△（）]*?[^と])とと金/g, '$1でと金')
+  return t.replace(/([▲△][^、。▲△（）]*?と)と(?=[取指寄上引逃打成突跳出回応受反攻迫追])/g, '$1で').replace(/([▲△](?:[^、。▲△（）ぁ-ん]|と)*?[^と])とと金/g, '$1でと金').replace(/るとと金/g, 'ると、と金')
     .replace(/([▲△][^、。▲△（）]*?と)(?=という|と[進続])/g, '$1、');
 }
 
@@ -1442,6 +1467,93 @@ function alsoStops(X) {
   return '';
 }
 
+// ---------------------------------------------------------------- この手の狙い（放っておくと・取ると）
+// 「次の狙い」として言えるもの。はっきりした厳しい狙いでなくても、動かした駒がそのまま成る・駒を取るなら言う
+function followUp(X) {
+  const T = X.mt;
+  if (!T || T.mate || X.takenNow) return null;
+  if (/から攻めを続ける$/.test(threatVerb(T)[0])) return T.real && T.gain >= 300 ? T : null;   // 中身を言えない狙い
+  if (T.real) return T;
+  const own = mFrom(T.T) === X.Mi.to, pr0 = T.L.promos.find(x => x.mine && x.kept && x.ply === 0);
+  const w = matWords(T.L, Math.min(T.L.horizon, 4));
+  if (own && T.gain >= 80 && (pr0 || (T.I.cap && T.I.see >= 100))) return T;
+  if (T.gain >= 150 && (pr0 || w.net >= 150 || T.L.promos.some(x => x.mine && x.kept && x.ply <= 2))) return T;
+  return null;
+}
+// 動かした（打った）駒を相手が取るとどうなるか。取った駒が元の場所を離れたせいで成立する手なら、そのことも言う
+function ifTaken(X) {
+  for (const t of X.takes) {
+    const L = t.L, k = L.kifs, n = L.moves.length;
+    if (n < 3 || t.v < X.score - 60) continue;
+    // 取ると単純に取り返されて損をする手（紐のついた駒を高い駒で取る）は、言うまでもない
+    if (E.seeMove(after(X.P, [X.M], 1), t.A) < 0) continue;
+    const seq = (j) => k.slice(2, j + 1).join('');
+    const pr = L.promos.find(p => p.mine && p.kept && p.ply >= 2 && p.ply <= 4);
+    const w = matWords(L, Math.min(L.horizon, 6), 1);
+    let res = '';
+    if (L.mated === (X.side ^ 1) && n <= 8) res = `${seq(n - 1)}で詰みます`;
+    else if (pr) res = pr.ply === 2 ? `${k[2]}と${NAME[pr.t]}を作れます` : `${seq(pr.ply)}で${NAME[pr.t]}を作れます`;
+    else if (w.net >= 150 && gainNoun(w)) {
+      const j = L.got.filter(x => x.ply >= 2 && x.ply <= Math.min(L.horizon, 6)).reduce((a, x) => Math.max(a, x.ply), 2);
+      res = j === 2 ? `${k[2]}で${gainNoun(w)}になります` : `${seq(j)}と進んで、${gainNoun(w)}になります`;
+    } else continue;
+    const F = L.moves[2], pM = after(X.P, [X.M], 1), from = mFrom(t.A);
+    let why = '';
+    if (mTo(F) !== X.Mi.to) {
+      const guarded = E.attacksFrom(pM, from).includes(mTo(F));
+      pM.doNull();
+      const F0 = pM.parseUSI(E.moveToUSI(F));
+      if (!F0 || (guarded && E.seeMove(pM, F0) < 0)) why = `${NAME[mPiece(t.A) & 15]}が${sqName(from)}を離れるので、`;
+    }
+    return { k: k[1], why, res, F: E.moveToUSI(F) };
+  }
+  return null;
+}
+function takenSentence(X, tk) {
+  return X.say('taken', [`${tk.k}と取ると、${tk.why}${tk.res}。`, `${tk.k}なら、${tk.why}${tk.res}。`, `${tk.k}と取ってくれば、${tk.why}${tk.res}。`]);
+}
+// この手のついでの働き：ほかの駒に紐をつける、眠っていた香車を使う
+function sideEffects(X) {
+  const I = X.Mi, P = X.P, side = X.side;
+  if (X.takenNow || X.inCheck || ['mate', 'book', 'forced'].includes(X.purpose)) return '';
+  const hits = E.attacksFrom(after(P, [X.M], 1), I.to);
+  const g = X.purpose === 'defend' && X.rtHandled === 'guarded' ? null : I.saved.filter(x => hits.includes(x.s)).sort((a, b) => b.g - a.g)[0];
+  let ck = '';
+  if (g) {
+    const p = P.clone();
+    p.doNull();
+    let best = 0;
+    for (const m of p.legalMoves()) if (mTo(m) === g.s && mCap(m) && (!best || E.PV[mPiece(m) & 15] < E.PV[mPiece(best) & 15])) best = m;
+    if (best) ck = kifOf(p, best, 0);
+  }
+  const dev = I.t === KY && !I.drop && !I.promo && X.purpose !== 'plan' && ORIGIN[side][KY].includes(I.from) && ahead(side, I.from, I.to) >= 2;
+  const guard = g ? `${sqName(g.s)}の${NAME[g.t]}に紐をつけて、${ck ? ck + 'と' : ''}取られないように` : '';
+  if (g && dev) return X.say('side.both', [`香車を前に出して働かせながら、${guard}しています。`, `自陣にいた香車を使いつつ、${guard}する意味もあります。`]);
+  if (g) return X.say('side.guard', [`${guard}する意味もあります。`, `同時に、${guard}しています。`]);
+  if (dev) return X.say('side.dev', ['自陣にいた香車を前に出して、働かせる意味もあります。', '動いていなかった香車が、これで働き始めます。']);
+  return '';
+}
+// 前の手で狙っていた手を、なぜ今は指さないのか（相手の受けで成立しなくなった）
+function aimNote(X) {
+  if (!X.aimPrev || X.aimPrev === X.main.move) return null;
+  const a = X.alts.find(x => x.c.m === X.aimPrev);
+  if (!a || !a.L || a.dv < 60 || !X.prev || !X.prev.k || X.twin(a)) return null;
+  // 相手の直前の手が受けになっているときだけ言う（関係のない手のあとで「狙いが消えた」とは言わない）
+  const pI = X.prevI;
+  if (!pI || !(pI.saved.length || pI.fled || pI.blocks.length || pI.to === mTo(a.A) || (pI.from && pI.from === mTo(a.A)))) return null;
+  let cause = `${X.prev.k}と受けられたので`;
+  if (X.prevI && X.prevP) {
+    const to = mTo(a.A);
+    const b = X.prevI.blocks.find(x => E.attacksFrom(X.prevP, x.s).includes(to) && !E.attacksFrom(X.P, x.s).includes(to)) ;
+    if (b) cause = `${X.prev.k}で${b.t === KA || b.t === UM ? NAME[b.t] + '道' : NAME[b.t] + 'の利き'}が止まったので`;
+  }
+  const L = a.L, taken = L.moves.length >= 2 && mTo(L.moves[1]) === a.I.to && mCap(L.moves[1]);
+  if (!taken && a.dv < 100) return null;
+  const cons = taken ? `いま指しても${L.kifs[1]}と取られるだけです` : 'いま指してもうまくいきません';
+  a.aimTold = true;
+  return X.say('aim.gone', [`前の手で狙っていた${a.k}は、${cause}、${cons}。`, `狙いだった${a.k}は、${cause}、${cons}。`]);
+}
+
 // ---------------------------------------------------------------- 組み立て
 function build(inp, memo) {
   memo = memo || MEMO;
@@ -1450,14 +1562,31 @@ function build(inp, memo) {
   if (!X) return null;
   const purpose = purposeOf(X);
   X.purpose = purpose;
-  const lead = LEAD[purpose](X);
+  const plain = purpose === 'book' || purpose === 'mate';
+  const fu = plain ? null : followUp(X), tk = plain ? null : ifTaken(X);
+  let lead;
+  if (purpose === 'sacrifice' && (fu || tk)) {
+    // 駒を差し出す手は、放っておくとどうなるか・取るとどうなるかで説明する
+    const what = X.Mi.drop ? `${NAME[X.Mi.t]}打ち` : '手';
+    lead = fu ? X.say('aim', [`${X.Mk}は、次に${threatNoun(fu)}を狙った${what}です。`, `${X.Mk}の狙いは、次の${threatNoun(fu)}です。`, `${X.Mk}と${X.v[1]}、次に${threatNoun(fu)}を見せました。`])
+      : X.say('aim.take', [`${X.Mk}は、取らせて得をする狙いの${what}です。`, `${X.Mk}は、あえて取らせる${what}です。`]);
+    X.used.add('mtTold'); X.used.add('comp');
+  } else lead = LEAD[purpose](X);
   X.leadText = lead;
   if (purpose === 'book') return { head: X.Mk, kind: purpose, paras: [polish(lead + tempoSentence(X, true))], rows: [], foot: '' };
   if (purpose === 'mate') return { head: X.Mk, kind: purpose, paras: [polish(lead)], rows: [], foot: X.main.dfpn ? '詰み探索（df-pn）で読み切った手順です。' : '' };
-  const p1 = [lead];
+  // 前の手の狙いを今は指せないなら、まずそのことから（だからこの手、という順に）
+  const gone = aimNote(X), reAim = !!(gone && fu && E.moveToUSI(fu.T) === X.aimPrev);
+  const p1 = [gone || '', lead];
   // 主な理由とは別に、この手の狙いや受けにも触れる
-  if (!['threat', 'mateThreat', 'promote', 'fork'].includes(purpose) && X.mt && X.mt.real && !X.mt.mate && X.mt.gain >= 300 && !(purpose === 'pawnStrike' && mFrom(X.mt.T) === X.Mi.to))
-    { p1.push(X.say('also.threat', [`さらに次は${threatNoun(X.mt)}も狙えます。`, `次に${threatNoun(X.mt)}が控えています。`])); X.used.add('mtTold'); }
+  if (!['threat', 'mateThreat', 'promote', 'fork'].includes(purpose) && fu && !X.used.has('mtTold') && !(purpose === 'pawnStrike' && mFrom(fu.T) === X.Mi.to && !fu.L.promos.some(x => x.mine && x.kept && x.ply === 0)))
+    { if (!reAim) p1.push(X.say('also.threat', [`さらに次は${threatNoun(fu)}も狙えます。`, `次に${threatNoun(fu)}が控えています。`, `放っておくと、次に${threatNoun(fu)}があります。`])); X.used.add('mtTold'); }
+  if (tk) p1.push(takenSentence(X, tk));
+  if (X.aimPrev && X.aimPrev === X.main.move && !['defend', 'defendMate', 'evasion', 'recapture', 'forced'].includes(purpose)) p1.push(X.say('aim.done', ['前の手からの狙いを、ここで実行しました。', '前の手で見せていた狙いどおりの一手です。']));
+  p1.push(sideEffects(X));
+  // 次の解説で「狙いがまだ成立するか」を確かめられるよう、言葉にした狙いの手を残す
+  X.aim = fu && (X.used.has('mtTold') || ['threat', 'promote'].includes(purpose)) ? E.moveToUSI(fu.T) : '';
+  if (reAim) p1.push(X.say('aim.again', [`これで、あらためて${fu.k}が狙えます。`, `この形なら、次こそ${fu.k}が狙いになります。`]));
   if (!['defend', 'defendMate'].includes(purpose) && X.rt && X.rt.real && X.rtHandled && X.rtHandled !== 'took' && !X.rt.mate && X.rt.gain >= 300)
     p1.push(alsoStops(X));
   else if (X.attacking && X.Mi.fled >= 300 && purpose !== 'escape')   // 当たりの駒を、攻めながらかわす
@@ -1471,7 +1600,7 @@ function build(inp, memo) {
   for (const a of X.alts) a.ref = refutation(X, a);
   // 有力な手が並んでいる局面
   const even = X.alts.filter(a => a.dv < 20 && !isMate(a.c.s) && !X.twin(a));
-  let alts = pickAlts(X);
+  let alts = pickAlts(X).filter(a => !a.aimTold);
   if (even.length >= 2 && memo.ago('many') >= 3) {
     memo.mark('many'); X.used.add('close');
     p1.unshift(X.say('many', [
@@ -1543,7 +1672,7 @@ function build(inp, memo) {
   if (p2) paras.push(p2);
   else if (X.d && X.d.partial && !X.d.depth) paras.push('ほかの候補との読み比べは、次の読みが始まったため途中で切り上げました。');
   if (purpose !== 'forced') { const m = metaSentence(X, top); if (m) paras.push(m); }
-  return { head: X.Mk, kind: purpose, paras: paras.filter(Boolean).map(polish), rows: tableRows(X), foot: footNote(X) };
+  return { head: X.Mk, kind: purpose, paras: paras.filter(Boolean).map(polish), rows: tableRows(X), foot: footNote(X), aim: X.aim };
 }
 
 function fmtEv(v) {
