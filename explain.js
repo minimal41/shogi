@@ -1103,6 +1103,19 @@ function refutation(X, a) {
   const weak = () => { const w = ['myKing', 'theirKing', 'act'].sort((p, q) => dAsp[p] - dAsp[q])[0]; return dAsp[w] > -40 ? '' : w; };
   const wA = matWords(L), loss = wA.net - matWords(X.La).net, dAsp = aspectDiff(X.La.parts, L.parts);
   const s1 = steps[1] && steps[1].I;
+  // 選んだ手の読み筋でも相手が指してくる手は、この手を選ばなかった理由にならない
+  const mainOpp = new Set();
+  for (const l of [X.L, X.La]) l.moves.forEach((m, i) => { if (i % 2 === 1 && i <= 5) mainOpp.add(E.moveToUSI(m)); });
+  const inMain = (m) => !!m && mainOpp.has(E.moveToUSI(m));
+  // 取られる駒を、その直前に自分で取られる場所へ動かしている（駒を切る・捨てる）なら、「取られる」ではなくそう言う。
+  // 当たりになっていて逃げ場がないのか（追い込まれて切る）、自分から切るのかも区別する
+  const cutOf = (x) => {
+    const j = x.ply - 1;
+    if (j < 2 || mTo(L.moves[j]) !== x.s) return null;
+    const p = after(X.P, L.moves, j), m = L.moves[j], from = mFrom(m);
+    const trapped = !!from && (enPrise(p, side).get(from) || 0) >= 150 && !p.legalMoves().some(q => mFrom(q) === from && E.seeMove(p, q) >= 0);
+    return { K: k[j], pre: span(1, j), got: mCap(m) & 15, trapped };
+  };
   // すぐに詰まされる
   if ((isMate(a.c.s) && a.c.s < 0) || L.mated === side) return at(1, 'mate', { line: k.slice(1, 6).join(''), cnt: Math.min(5, k.length - 1), more: k.length > 6 });
   if (a.omK && a.omK.length) return at(1, 'mate', { line: a.omK.slice(0, 5).join(''), cnt: Math.min(5, a.omK.length), more: a.omK.length > 5, n: a.omK.length, K: a.omK[0] });
@@ -1119,7 +1132,7 @@ function refutation(X, a) {
     if (!st.I || st.i > 5) continue;
     const big = st.I.threats.filter(t => t.t !== FU && t.g >= 300 && st.I.hits.some(h => h.s === t.s));
     const won = L.lost.find(x => x.ply > st.i && big.some(t => t.s === x.s));
-    if (won && (big.length >= 2 || st.I.check)) return at(st.i, 'fork', { big, check: st.I.check && big.length < 2 });
+    if (won && (big.length >= 2 || st.I.check) && !inMain(L.moves[st.i])) return at(st.i, 'fork', { big, check: st.I.check && big.length < 2 });
   }
   // 動かした駒がただで取られる／その駒が守っていた駒を取られる
   if (loss <= -150) for (const e of a.I.exposed) {
@@ -1138,17 +1151,17 @@ function refutation(X, a) {
     for (const t of matWords(X.La).l) { const j = extra.indexOf(t); if (j >= 0) extra.splice(j, 1); }
     const t = extra.sort((p, q) => HV[q] - HV[p])[0];
     mc = t && unpairedLost(L, t, L.horizon).find(x => x.ply >= 1 && x.ply <= (t !== FU || x.s === a.I.to ? 7 : 3));
-    if (mc && t !== FU) return at(mc.ply, 'material', { piece: mc });
+    if (mc && t !== FU) return at(mc.ply, 'material', { piece: mc, cut: cutOf(mc) });
   }
   // 成り駒を作られる
   const pr = L.promos.find(p => !p.mine && p.kept && p.ply <= 6 && (p.t === RY || p.t === UM || cheb(p.s, X.P.kingSq[side]) <= 3));
   if (pr && a.dv >= 60 && !X.La.promos.some(q => !q.mine && q.kept && q.t === pr.t)) return at(pr.ply, 'promo', { promo: pr });
-  if (mc) return at(mc.ply, 'material', { piece: mc });
+  if (mc) return at(mc.ply, 'material', { piece: mc, cut: cutOf(mc) });
   // 相手の応手に厳しい狙いがある（選んだ手でも同じ応手が来るなら、理由にはならない）
   const sameReply = [X.L, X.La].some(l => l.moves[1] && E.moveToUSI(l.moves[1]) === E.moveToUSI(L.moves[1]));
   // （その狙いの駒を次にこちらが取れるなら、狙いとは言わない：▲同歩と取るだけの歩など）
   const takesIt = a.tr && L.moves[2] && mCap(L.moves[2]) && mTo(L.moves[2]) === (mFrom(a.tr.T) || mTo(L.moves[1]));
-  if (a.tr && a.tr.real && a.dv >= 60 && !sameReply && !takesIt) return at(1, 'replyThreat', { tr: a.tr });
+  if (a.tr && a.tr.real && a.dv >= 60 && !sameReply && !takesIt && !inMain(a.tr.T)) return at(1, 'replyThreat', { tr: a.tr });
   // 出た駒を追い返される（手損）
   if (s1 && a.dv >= 30 && s1.threats.some(t => t.s === a.I.to) && L.moves[2] && mFrom(L.moves[2]) === a.I.to) return at(1, 'pushedBack', { back: k[2] });
   // 序盤の手損：自分から交換して相手に取り返される、同じ駒を二度動かす
@@ -1170,10 +1183,11 @@ function refutation(X, a) {
   // 反撃される
   const ct = s1 && s1.threats.find(t => t.t !== FU && t.g >= 300);
   if (ct && a.dv >= 60 && !sameReply) return at(1, 'counter', { target: ct });
-  return at(Math.min(3, L.moves.length - 1), 'generic');
+  return at(Math.min(3, L.moves.length - 1), 'generic', { same: sameReply });
 }
 const SHARP = new Set(['mate', 'threatLeft', 'fork', 'noTake', 'tempoTrade', 'loose', 'exposed', 'badTrade', 'material', 'promo', 'replyThreat', 'pushedBack', 'kingRun', 'counter']);
 
+const cutVerb = (t) => (t === HI || t === KA || t === RY || t === UM ? '切る' : '捨てる');
 // 理由を名詞句で（「△５五角の両取り」「△同銀と取り返されて損をする筋」など）。ほかの文に埋め込むとき用
 function problemNoun(X, r) {
   const pre = r.pre ? `${r.pre}からの` : '';
@@ -1185,7 +1199,7 @@ function problemNoun(X, r) {
     case 'loose': return `${r.key === 1 ? r.K : r.seq}でただ取られてしまう筋`;
     case 'exposed': return `${r.seq}で${NAME[r.piece.t]}を取られる筋`;
     case 'badTrade': return `${r.K}と取り返されて損をする筋`;
-    case 'material': return `${r.seq}で${NAME[r.piece.board]}を取られる筋`;
+    case 'material': return r.cut ? `${r.cut.pre}のあと${r.cut.K}と${NAME[r.piece.board]}を${cutVerb(r.piece.board)}ことになる筋` : `${r.seq}で${NAME[r.piece.board]}を取られる筋`;
     case 'promo': return `${r.seq}で${NAME[r.promo.t]}を作られる筋`;
     case 'replyThreat': return r.tr.mate ? `${r.K}が詰めろになる筋` : `${r.K}のあと、${threatVerb(r.tr)[0]}狙い`;
     case 'pushedBack': return `${r.K}で追い返される筋`;
@@ -1284,7 +1298,14 @@ function whyNot(X, a, nth) {
       `${A}と${nm(a.I.cap)}を取るのは、${K}と取り返されると${nm(a.I.nt)}を渡すだけの交換になります。`,
     ]);
     case 'material': {
-      const p = nm(r.piece.board);
+      const p = nm(r.piece.board), c = r.cut;
+      if (c) {
+        const act = `${c.K}と${p}を${cutVerb(r.piece.board)}`, tail = c.got ? `${p}と${nm(c.got)}の交換は駒損なので、` : `${p}を失うので、`;
+        return lead + X.say('why.cut', [
+          `${cond}、${c.pre}のあと、${c.trapped ? `${p}に逃げ場がなく、${act}しかなくなります` : `${act}ことになります`}。${tail}${A}は避けました。`,
+          `${A}には${c.pre}という手があり、${c.trapped ? `当たりになった${p}の逃げ場がないので、${act}しかありません` : `そのあと${act}ことになります`}。${tail}選びませんでした。`,
+        ]);
+      }
       return lead + X.say('why.mat', [
         r.key === 1 ? `${cond}、${K}で${p}を取られてしまうので、${A}は避けました。` : `${cond}、${r.seq}と進んで${p}を取られてしまうので、${A}は避けました。`,
         `${A}には${r.key === 1 ? K + 'があり' : r.seq + 'という手順があり'}、${p}を取られて駒損になります。`,
@@ -1354,14 +1375,16 @@ function whyNot(X, a, nth) {
     }
     default: {
       const w = r.w, then = r.rest ? `以下${r.rest}と進むと、` : '';
+      // 相手の応手が選んだ手のときと同じなら、その応手のせいにはしない（手順全体を比べた言い方にする）
+      const R = (t) => (r.same ? null : t), vs = r.same ? `${M}のときと比べて、` : '';
       if (!w) return lead + X.say('why.gen0', [
-        `${A}には${r.R1}という応手があり、${then}${M}の変化より指しにくくなるので、選びませんでした。`,
+        R(`${A}には${r.R1}という応手があり、${then}${M}の変化より指しにくくなるので、選びませんでした。`),
         `${A}だと${r.seq}と進んで、${M}ほど良い形にはなりません。`,
       ]);
       return lead + X.say('why.gen.' + w, {
-        myKing: [`${A}には${r.R1}という応手があり、${then}こちらの玉の囲いが薄くなります。`, `${A}だと${r.seq}と進んで、玉の守りが手薄になってしまいます。`],
-        theirKing: [`${A}だと${r.R1}と応じられて、あなたの玉に迫る手がかりが少なくなります。`, `${A}は${r.seq}と進むと、攻めの形が作りにくくなります。`],
-        act: [`${A}は${r.seq}と進んだあと、駒がうまく働かない形になってしまいます。`, `${A}だと${r.R1}と応じられて、駒の働きが悪い形になります。`],
+        myKing: [R(`${A}には${r.R1}という応手があり、${then}こちらの玉の囲いが薄くなります。`), `${A}だと${r.seq}と進んで、${vs}玉の守りが手薄になってしまいます。`],
+        theirKing: [R(`${A}だと${r.R1}と応じられて、あなたの玉に迫る手がかりが少なくなります。`), `${A}は${r.seq}と進むと、${vs}攻めの形が作りにくくなります。`],
+        act: [`${A}は${r.seq}と進んだあと、${vs}駒がうまく働かない形になってしまいます。`, R(`${A}だと${r.R1}と応じられて、駒の働きが悪い形になります。`)],
       }[w]);
     }
   }
