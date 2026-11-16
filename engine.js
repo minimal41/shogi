@@ -1412,16 +1412,21 @@ const B_UPPER = 1, B_LOWER = 2, B_EXACT = 3;
 const now = (typeof performance !== 'undefined' && performance.now) ? () => performance.now() : () => Date.now();
 
 class TTable {
-  constructor(bits) {
-    this.size = 1 << bits; this.mask = this.size - 1;
-    this.key = new Int32Array(this.size);
-    this.move = new Int32Array(this.size);
-    this.score = new Int16Array(this.size);
-    this.ev = new Int16Array(this.size);
-    this.depth = new Int8Array(this.size);
-    this.flag = new Uint8Array(this.size);
+  // shared: the entries live in SharedArrayBuffers so that helper threads can search with the same table.
+  // bufs: attach to the buffers of an existing shared table (a helper thread's view of it)
+  constructor(bits, shared, bufs) {
+    this.size = 1 << bits; this.mask = this.size - 1; this.bits = bits;
+    this.shared = !!(shared || bufs);
+    const mk = (T, name) => (bufs ? new T(bufs[name]) : shared ? new T(new SharedArrayBuffer(this.size * T.BYTES_PER_ELEMENT)) : new T(this.size));
+    this.key = mk(Int32Array, 'key');
+    this.move = mk(Int32Array, 'move');
+    this.score = mk(Int16Array, 'score');
+    this.ev = mk(Int16Array, 'ev');
+    this.depth = mk(Int8Array, 'depth');
+    this.flag = mk(Uint8Array, 'flag');
     this.age = 0;
   }
+  buffers() { return { key: this.key.buffer, move: this.move.buffer, score: this.score.buffer, ev: this.ev.buffer, depth: this.depth.buffer, flag: this.flag.buffer }; }
   clear() { this.key.fill(0); this.move.fill(0); this.flag.fill(0); this.depth.fill(0); }
   probe(lo, hi) {
     const i = (lo & this.mask) & ~1;
@@ -1652,9 +1657,10 @@ for (let i = 0; i < 81; i++) IDX81[SQ81[i]] = i;
 const CH_N = 32 * 81;
 
 class Searcher {
-  constructor(ttBits) {
+  constructor(ttBits, tt) {
     this.pos = new Position();
-    this.tt = new TTable(ttBits || 20);
+    this.tt = tt || new TTable(ttBits || 20);
+    this.ctl = null; this.searchId = 0; this.slot = 0;   // helper threads: shared control words (see SMP below)
     this.dfpn = null;
     this.hist = new Int32Array(64 * NSQ);
     this.killers = new Int32Array(MAX_SPLY * 2 + 8);
@@ -1704,6 +1710,10 @@ class Searcher {
 
   checkTime() {
     if (this.nodes >= this.nodeLimit || now() >= this.deadline) this.stopped = true;
+    if (this.ctl !== null) {   // a helper thread stops when the main thread's search is over, and reports its node count
+      if (Atomics.load(this.ctl, 0) !== this.searchId) this.stopped = true;
+      Atomics.store(this.ctl, this.slot, this.nodes);
+    }
   }
 
   drawValue() { return this.pos.stm === this.rootSide ? -this.contempt : this.contempt; }
@@ -2264,6 +2274,41 @@ class Searcher {
     return result;
   }
 
+  // A helper thread's search: the same iterative deepening on the same position, sharing the main
+  // thread's transposition table. It runs until the main thread ends the search; only the table
+  // entries it leaves behind are used. Every other helper starts one ply deeper so that they do
+  // not all do the same work.
+  helperThink(k) {
+    const pos = this.pos;
+    this.nodes = 0; this.stopped = false; this.deadline = Infinity; this.nodeLimit = Infinity;
+    this.rootSide = pos.stm; this.rootEffort = new Map();
+    this.killers.fill(0);
+    for (let i = 0; i < this.hist.length; i++) this.hist[i] = this.hist[i] >> 1;
+    pos.histCheck[pos.ply] = pos.inCheck() ? 1 : 0;
+    this.checkTime();
+    let prev = 0;
+    for (let depth = 1 + (k & 1); depth <= MAX_SPLY - 12 && !this.stopped; depth++) {
+      this.rootDepth = depth;
+      let delta = 30, alpha = -INF, beta = INF;
+      if (depth >= 4 && Math.abs(prev) < MATE_IN_MAX) { alpha = prev - delta; beta = prev + delta; }
+      let score;
+      for (;;) {
+        this.rootScores = new Map(); this.iterBest = 0; this.iterBestScore = -INF;
+        score = this.search(alpha, beta, depth, 0, false);
+        if (this.stopped) break;
+        if (score <= alpha) { beta = (alpha + beta) >> 1; alpha = Math.max(-INF, score - delta); }
+        else if (score >= beta) beta = Math.min(INF, score + delta);
+        else break;
+        delta += (delta >> 1) + 10;
+        if (delta > 1200) { alpha = -INF; beta = INF; }
+      }
+      if (this.stopped) break;
+      prev = score;
+      if (Math.abs(score) >= MATE_IN_MAX && depth > (MATE - Math.abs(score)) + 4) break;
+    }
+    this.checkTime();
+  }
+
   // Weak play: score every root move with a shallow search and pick with noise
   thinkWeak(opts) {
     const pos = this.pos;
@@ -2422,7 +2467,7 @@ function exSlice(job) {
   if (job.cancelled) return;
   job.sliceEnd = now() + EX_SLICE_MS;
   for (;;) {
-    if (job.gen.next().done) { if (exJob === job) exJob = null; exPublish(job, false); return; }
+    if (job.gen.next().done) { if (exJob === job) exJob = null; exPublish(job, false); startPonder(); return; }
     if (now() >= job.sliceEnd) break;
   }
   setTimeout(() => exSlice(job), 0);
@@ -2615,9 +2660,133 @@ function exPublish(job, partial) {
 }
 
 // ---------------------------------------------------------------------------
+// Several threads (only where the page is cross-origin isolated, so SharedArrayBuffer exists):
+// helper workers run the same search on the same position and share the transposition table, so
+// each profits from what the others have already read. The main thread alone decides the move
+// and when to stop. SMP.spawn is set by the worker (or a test) to a function that starts a helper.
+// ctl[0]: id of the search in progress (0: none), ctl[1 + k]: nodes searched by helper k.
+// ---------------------------------------------------------------------------
+const SMP = { spawn: null, helpers: [], ctl: null, active: 0, max: 7 };
+const SMP_COPY = ['contempt', 'repLimit', 'useMate1', 'mate1Depth', 'qsChecks', 'lmpImpBase', 'lmpImpMul', 'lmpBase', 'lmpMul', 'futBase', 'futMul', 'rfpMul', 'lmrHistDiv'];
+function smpPrepare(searcher, n) {
+  if (!SMP.spawn || typeof SharedArrayBuffer === 'undefined' || typeof Atomics === 'undefined') return 0;
+  n = Math.min(n, SMP.max);
+  try {
+    if (!searcher.tt.shared) searcher.tt = new TTable(searcher.tt.bits, true);
+    if (!SMP.ctl) SMP.ctl = new Int32Array(new SharedArrayBuffer(4 * (2 + SMP.max)));
+    while (SMP.helpers.length < n) SMP.helpers.push({ w: SMP.spawn(), tt: null });
+    for (const h of SMP.helpers) if (h.tt !== searcher.tt) {
+      h.w.postMessage({ type: 'smp-init', bits: searcher.tt.bits, bufs: searcher.tt.buffers(), ctl: SMP.ctl.buffer });
+      h.tt = searcher.tt;
+    }
+  } catch (e) { SMP.spawn = null; return 0; }   // no nested workers / no shared memory here: stay single-threaded
+  return n;
+}
+function smpStart(searcher, msg, n) {
+  n = smpPrepare(searcher, n);
+  if (!n) return;
+  const opts = {};
+  for (const k of SMP_COPY) opts[k] = searcher[k];
+  opts.lmrDiv = searcher.lmrDiv;
+  for (let k = 0; k < SMP.max; k++) SMP.ctl[1 + k] = 0;
+  Atomics.store(SMP.ctl, 0, msg.id);
+  SMP.active = n;
+  for (let k = 0; k < n; k++) SMP.helpers[k].w.postMessage({ type: 'smp-go', id: msg.id, k, sfen: msg.sfen || START_SFEN, moves: msg.moves || [], age: (searcher.tt.age + 1) & 63, opts });
+}
+function smpStop() { if (SMP.ctl) Atomics.store(SMP.ctl, 0, 0); SMP.active = 0; }
+function smpNodes() { let n = 0; for (let k = 0; k < SMP.active; k++) n += Atomics.load(SMP.ctl, 1 + k); return n; }
+// --- in a helper thread
+let smpSelf = null;
+function smpHelperMsg(msg) {
+  if (msg.type === 'smp-init') {
+    smpSelf = new Searcher(0, new TTable(msg.bits, true, msg.bufs));
+    smpSelf.ctl = new Int32Array(msg.ctl);
+  } else if (msg.type === 'smp-go') {
+    const s = smpSelf;
+    if (!s || Atomics.load(s.ctl, 0) !== msg.id) return;   // that search is already over
+    for (const k of SMP_COPY) s[k] = msg.opts[k];
+    if (s.lmrDiv !== msg.opts.lmrDiv) s.setLmrDiv(msg.opts.lmrDiv);
+    s.searchId = msg.id; s.slot = 1 + msg.k; s.tt.age = msg.age;
+    const pos = s.pos;
+    pos.setSFEN(msg.sfen);
+    for (const u of msg.moves) { const m = pos.parseUSI(u); if (!m) return; pos.doMove(m); pos.histCheck[pos.ply] = pos.inCheck() ? 1 : 0; }
+    s.helperThink(msg.k);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pondering: after the move has been sent (and the explanation, if any, is finished), keep reading
+// the position the opponent is now looking at, in short slices so that the next request is picked
+// up at once. Whatever it learns stays in the transposition table for the next search; the time
+// the engine takes to answer is unchanged.
+// ---------------------------------------------------------------------------
+const PONDER_SLICE_MS = 150;
+let ponderJob = null, ponderWait = null;
+function cancelPonder() {
+  ponderWait = null;
+  if (ponderJob) { ponderJob.cancelled = true; ponderJob = null; }
+}
+// `s.pos` must already be the position to ponder (the opponent to move)
+function makePonderJob(s, ms) {
+  const job = { s, end: now() + ms, sliceEnd: 0, cancelled: false, depth: 0 };
+  job.gen = ponderSteps(job);
+  return job;
+}
+function* ponderSteps(job) {
+  const s = job.s, pos = s.pos;
+  s.nodes = 0; s.nodeLimit = Infinity;
+  s.rootSide = pos.stm ^ 1;            // draws are valued as in the search that will follow
+  s.rootEffort = new Map();
+  pos.histCheck[pos.ply] = pos.inCheck() ? 1 : 0;
+  let prev = 0;
+  for (let depth = 1; depth <= MAX_SPLY - 12; depth++) {
+    s.rootDepth = depth;
+    let delta = 30, alpha = -INF, beta = INF;
+    if (depth >= 4 && Math.abs(prev) < MATE_IN_MAX) { alpha = prev - delta; beta = prev + delta; }
+    let score;
+    for (;;) {
+      // one search; if the slice ends first it is retried in the next one (the table keeps the work done)
+      for (;;) {
+        s.stopped = false; s.deadline = Math.min(job.end, job.sliceEnd);
+        s.rootScores = new Map(); s.iterBest = 0; s.iterBestScore = -INF;
+        score = s.search(alpha, beta, depth, 0, false);
+        if (!s.stopped) break;
+        if (now() >= job.end) return;
+        yield;
+      }
+      if (score <= alpha) { beta = (alpha + beta) >> 1; alpha = Math.max(-INF, score - delta); }
+      else if (score >= beta) beta = Math.min(INF, score + delta);
+      else break;
+      delta += (delta >> 1) + 10;
+      if (delta > 1200) { alpha = -INF; beta = INF; }
+    }
+    prev = score; job.depth = depth;
+    if (Math.abs(score) >= MATE_IN_MAX || now() >= job.end) return;
+    yield;
+  }
+}
+function ponderSlice(job) {
+  if (job.cancelled) return;
+  job.sliceEnd = now() + PONDER_SLICE_MS;
+  if (job.gen.next().done) { if (ponderJob === job) ponderJob = null; return; }
+  setTimeout(() => ponderSlice(job), 0);
+}
+function startPonder() {
+  const w = ponderWait;
+  ponderWait = null;
+  if (!w || exJob) return;
+  const pos = w.s.pos;
+  pos.setSFEN(w.sfen);
+  for (const u of w.moves) { const m = pos.parseUSI(u); if (!m) return; pos.doMove(m); pos.histCheck[pos.ply] = pos.inCheck() ? 1 : 0; }
+  ponderJob = makePonderJob(w.s, w.ms);
+  setTimeout(() => { if (ponderJob) ponderSlice(ponderJob); }, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Request handling (shared by the Web Worker and the main-thread fallback)
 // ---------------------------------------------------------------------------
 function handleGo(searcher, msg, post) {
+  cancelPonder();
   cancelExplain(true);   // a new request ends an explanation still in progress (sending what it has)
   const pos = searcher.pos;
   pos.setSFEN(msg.sfen || START_SFEN);
@@ -2634,27 +2803,45 @@ function handleGo(searcher, msg, post) {
   }
   if (!res) {
     if (msg.weak) res = searcher.thinkWeak({ depth: msg.weak.depth, noise: msg.weak.noise, seeMates: msg.weak.seeMates });
-    else res = searcher.think({
-      timeMs: msg.timeMs || 1000, maxDepth: msg.maxDepth || 64, mateNodes: msg.mateNodes || 0, nodes: msg.nodes,
-      softRatio: msg.softRatio, easyRatio: msg.easyRatio, easyStable: msg.easyStable, mateTimeCap: msg.mateTimeCap,
-      onInfo: (info) => post({ type: 'info', id: msg.id, depth: info.depth, score: info.score, mate: info.mate, nodes: info.nodes, time: info.time, pv: info.pv.map(moveToUSI) })
-    });
+    else {
+      if (msg.threads > 1) smpStart(searcher, msg, msg.threads - 1);
+      res = searcher.think({
+        timeMs: msg.timeMs || 1000, maxDepth: msg.maxDepth || 64, mateNodes: msg.mateNodes || 0, nodes: msg.nodes,
+        softRatio: msg.softRatio, easyRatio: msg.easyRatio, easyStable: msg.easyStable, mateTimeCap: msg.mateTimeCap,
+        onInfo: (info) => post({ type: 'info', id: msg.id, depth: info.depth, score: info.score, mate: info.mate, nodes: info.nodes + smpNodes(), time: info.time, pv: info.pv.map(moveToUSI) })
+      });
+      res.nodes += smpNodes();
+      smpStop();
+    }
   }
   post({ type: 'bestmove', id: msg.id, move: res.move ? moveToUSI(res.move) : 'resign', score: res.score, mate: res.mate, depth: res.depth, nodes: res.nodes, time: res.time, pv: res.pv.map(moveToUSI), book: !!res.book, dfpn: !!res.dfpn });
   // only now, with the move already sent, work out why it was chosen
   if (msg.explain && res.move && !res.book && !msg.weak) startExplain(searcher, res, msg, post);
+  // and read ahead while the opponent thinks (once the explanation is done)
+  if (msg.ponder && res.move && !msg.weak && Math.abs(res.score) < MATE_IN_MAX) {
+    ponderWait = { s: searcher, sfen: msg.sfen || START_SFEN, moves: (msg.moves || []).concat(moveToUSI(res.move)), ms: msg.ponder.timeMs || 10000 };
+    if (!exJob) startPonder();
+  }
 }
-Object.assign(api, { handleGo, cancelExplain, startExplain, evalParts, seeMove, attacksFrom, OverlayTT });
+Object.assign(api, { handleGo, cancelExplain, cancelPonder, makePonderJob, SMP, smpPrepare, smpHelperMsg, startExplain, evalParts, seeMove, attacksFrom, OverlayTT });
 
 if (typeof importScripts === 'function' && typeof document === 'undefined' && typeof self !== 'undefined') {
   let searcher = null;
+  if (typeof Worker === 'function' && self.location && /^https?:/.test(self.location.href)) SMP.spawn = () => new Worker(self.location.href);
   self.onmessage = function (ev) {
     const msg = ev.data;
-    if (msg.type === 'go') {
+    if (msg.type === 'smp-init' || msg.type === 'smp-go') { smpHelperMsg(msg); return; }   // this worker is a helper thread
+    if (msg.type === 'setup') {
+      // start the helper threads ahead of the first search (a worker blocked in a search cannot start them)
+      if (msg.threads > 1) { if (!searcher) searcher = new Searcher(msg.ttBits || 20); smpPrepare(searcher, msg.threads - 1); }
+    } else if (msg.type === 'go') {
       if (!searcher || (msg.ttBits && searcher.tt.size !== (1 << msg.ttBits))) searcher = new Searcher(msg.ttBits || 20);
       handleGo(searcher, msg, (x) => self.postMessage(x));
     } else if (msg.type === 'cancel-explain') {
       cancelExplain(false);
+      startPonder();
+    } else if (msg.type === 'stop') {
+      cancelPonder();
     } else if (msg.type === 'ping') {
       self.postMessage({ type: 'pong' });
     }

@@ -12,10 +12,12 @@ const LEVELS = [
   { name: '初級', desc: '目先の駒得を狙ってきます。王手や詰みの筋はあまり読みません。', req: { weak: { depth: 2, noise: 110 }, book: true } },
   { name: '中級', desc: '3手先まで読み、詰みも見逃しません。手加減は少しだけ。', req: { weak: { depth: 3, noise: 35, seeMates: true }, book: true } },
   { name: '上級', desc: '1手3秒の本気の読み。定跡と詰み探索を使います。', req: { timeMs: 3000, mateNodes: 60000, book: true, ttBits: 20 } },
-  { name: '最強', desc: '1手10秒。αβ探索と詰み探索を全力で回す、千里眼の本気です。', req: { timeMs: 10000, mateNodes: 400000, book: true, ttBits: 21 }, explainMs: 6000 },
-  { name: '長考', desc: '1手最大30秒。最強の3倍の時間と大きな置換表で、さらに深く読みます。待ち時間は長めです。', req: { timeMs: 30000, mateNodes: 1500000, book: true, ttBits: 22, softRatio: 0.7, easyRatio: 0.5, easyStable: 8, mateTimeCap: 4000 }, explainMs: 10000 },
+  { name: '最強', desc: '1手10秒。αβ探索と詰み探索を全力で回す、千里眼の本気です。あなたの手番のあいだも先を読んでいます。', req: { timeMs: 10000, mateNodes: 400000, book: true, ttBits: 21 }, explainMs: 6000, ponderMs: 30000, smp: true },
+  { name: '長考', desc: '1手最大30秒。最強の3倍の時間と大きな置換表で、さらに深く読みます。あなたの手番のあいだも先を読んでいます。待ち時間は長めです。', req: { timeMs: 30000, mateNodes: 1500000, book: true, ttBits: 22, softRatio: 0.7, easyRatio: 0.5, easyStable: 8, mateTimeCap: 4000 }, explainMs: 10000, ponderMs: 60000, smp: true },
 ];
 // explainMs: 指したあと（あなたの手番のあいだ）に、理由を言葉にするための読み比べに使う時間
+// ponderMs: そのあと、あなたが考えているあいだに先読みを続ける時間の上限（読んだ内容は次の手の探索で使う。
+//           千里眼が指すまでの時間は変わらない）
 const STORE_KEY = 'senrigan-shogi-v1';
 const KANJI = E.KANJI_NUM, ZEN = E.ZEN_NUM;
 const HAND_ORDER = [E.HI, E.KA, E.KI, E.GI, E.KE, E.KY, E.FU];
@@ -88,6 +90,28 @@ function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(G)); } ca
 function load() { try { const s = localStorage.getItem(STORE_KEY); if (s) { const g = JSON.parse(s); if (g && g.v === 1 && Array.isArray(g.moves)) return g; } } catch (e) { /* ignore */ } return null; }
 
 // ---------------------------------------------------------------- engine
+// 複数コアでの読み：ページがクロスオリジン分離されていれば（sw.js がそのためのヘッダーを足す）、
+// 共有メモリが使えるので、最強・長考ではコア数の半分（最大 4）のスレッドで同時に読む。
+const COI_KEY = 'senrigan-coi-reload';
+const THREADS = (() => {
+  try { if (!self.crossOriginIsolated || typeof SharedArrayBuffer === 'undefined') return 1; } catch (e) { return 1; }
+  return Math.max(1, Math.min(4, Math.floor((navigator.hardwareConcurrency || 2) / 2)));
+})();
+function setupIsolation() {
+  let isolated = false;
+  try { isolated = !!self.crossOriginIsolated; } catch (e) { /* ignore */ }
+  if (isolated) { try { sessionStorage.removeItem(COI_KEY); } catch (e) { /* ignore */ } return; }
+  if (!('serviceWorker' in navigator) || !/^https?:$/.test(location.protocol)) return;
+  // 初めて開いたときは、サービスワーカーが働き始めたところで一度だけ読み込み直す（対局は保存されている）
+  const once = () => {
+    try { if (sessionStorage.getItem(COI_KEY)) return; sessionStorage.setItem(COI_KEY, '1'); } catch (e) { return; }
+    location.reload();
+  };
+  navigator.serviceWorker.register('sw.js').then((reg) => {
+    if (reg.active && !navigator.serviceWorker.controller) once();
+    navigator.serviceWorker.addEventListener('controllerchange', once);
+  }).catch(() => { /* 使えない環境では 1 コアのまま */ });
+}
 let worker = null, mode = 'worker', seq = 0, pending = null, localSearcher = null;
 let workerKind = 'file';      // 'file' = engine.js を直接 Worker に / 'blob' = 読み込み済みソースから生成
 function makeWorker(kind) {
@@ -105,6 +129,7 @@ function startWorker() {
   }
   if (!worker) { mode = 'local'; return; }
   mode = 'worker';
+  if (THREADS > 1 && workerKind === 'file') worker.postMessage({ type: 'setup', threads: THREADS, ttBits: 21 });
   worker.onmessage = (e) => onEngine(e.data);
   worker.onerror = (e) => {
     if (e && e.preventDefault) e.preventDefault();
@@ -156,6 +181,10 @@ function onEngine(d) {
   pending = null;
   if (purpose === 'ai') onAIMove(d, msg); else onHint(d);
 }
+// 先読み（と解説用の読み）をやめさせる：対局が終わったとき、ページが隠れたとき
+function quietEngine() {
+  if (mode === 'worker' && worker && !pending) worker.postMessage({ type: 'stop' });
+}
 function cancelWhy() {
   why = null;
   if (mode === 'worker' && worker) worker.postMessage({ type: 'cancel-explain' });
@@ -173,6 +202,8 @@ function requestAI() {
     const last = G.notes[G.moves.length - 2];   // 前の手で狙っていた手（まだ成立するかを読み比べに加える）
     if (last && last.aim) req.explain.aim = last.aim;
   }
+  if (L.ponderMs && mode === 'worker') req.ponder = { timeMs: L.ponderMs };
+  if (L.smp && THREADS > 1 && mode === 'worker' && workerKind === 'file') req.threads = THREADS;
   startThinkBar(req.timeMs ? (mode === 'local' ? Math.min(req.timeMs, 2500) : req.timeMs) : 0);
   ask('ai', req);
 }
@@ -293,6 +324,7 @@ function detectEnd() {
 
 function finish(res) {
   stopEngine();
+  quietEngine();
   thinking = false;
   res.plies = G.moves.length;
   G.result = res;
@@ -314,6 +346,7 @@ function userMove(m) {
 
 function startNew() {
   stopEngine();
+  quietEngine();
   const sv = document.querySelector('input[name="side"]:checked').value;
   let side = sv === '1' ? WHITE : BLACK, furi = false;
   if (sv === 'r') { side = Math.random() < 0.5 ? BLACK : WHITE; furi = true; }
@@ -379,7 +412,8 @@ function askHint() {
   if (!canAct()) return;
   hint = { loading: true };
   renderHint();
-  ask('hint', { timeMs: 2500, mateNodes: 40000, ttBits: 20 });
+  // 置換表の大きさは対局と同じにする（違うと千里眼の探索の記憶が作り直しになる）
+  ask('hint', { timeMs: 2500, mateNodes: 40000, ttBits: LEVELS[G.level].req.ttBits || 20 });
 }
 
 // ---------------------------------------------------------------- input
@@ -949,10 +983,12 @@ function boot(data) {
   document.querySelector(`input[name="level"][value="${G.level}"]`).checked = true;
   buildBoard();
   rebuild();
+  setupIsolation();
   startWorker();
   sizeVars();
   if (window.ResizeObserver) new ResizeObserver(sizeVars).observe(boardEl);
   else window.addEventListener('resize', sizeVars);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) quietEngine(); });
 
   document.querySelector('.table').addEventListener('click', (e) => {
     const hp = e.target.closest('.hp');
